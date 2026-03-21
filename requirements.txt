@@ -1,0 +1,20 @@
+# Core
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+
+# Deep learning
+torch>=2.1.0
+
+# Baselines & data
+xgboost>=2.0.0
+yfinance>=0.2.30
+
+# EDA / notebooks
+matplotlib>=3.7.0
+seaborn>=0.13.0
+jupyter>=1.0.0
+ipykernel>=6.25.0
+
+# Utils
+tqdm>=4.66.0
