@@ -405,4 +405,6 @@ def main() -> None:
         enriched.to_csv(out_path, index=False)
         print(f"Saved: {out_path}")
 
-main()
+
+if __name__ == "__main__":
+    main()

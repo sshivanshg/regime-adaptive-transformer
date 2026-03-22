@@ -1,105 +1,68 @@
-#!/usr/bin/env python3
 """
-Evaluate a saved checkpoint on the chronological test split.
+evaluate.py
+===========
+Loads XGBoost out-of-sample predictions and computes
+final metrics per ticker and averaged across all tickers.
+
+Usage:
+    python evaluate.py
 """
-from __future__ import annotations
 
-import argparse
-import sys
-from pathlib import Path
-
-import joblib
+import pandas as pd
 import numpy as np
-import torch
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
-
-ROOT = Path(__file__).resolve().parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from features.feature_engineering import build_dataset_from_csv
-from models.baseline_lstm import init_model as init_lstm
-from models.baseline_xgboost import evaluate_classifier, last_timestep
-from models.ramt import RegimeAdaptiveTransformer
+import os
 
 
-def report_metrics(y: np.ndarray, proba: np.ndarray) -> dict:
-    pred = (proba >= 0.5).astype(np.int64)
-    out = {
-        "accuracy": float(accuracy_score(y, pred)),
-        "f1": float(f1_score(y, pred, zero_division=0)),
-    }
-    if len(np.unique(y)) > 1:
-        out["roc_auc"] = float(roc_auc_score(y, proba))
-    else:
-        out["roc_auc"] = float("nan")
-    return out
+def compute_metrics(df_ticker):
+    y_true = df_ticker["y_true"].values
+    y_pred = df_ticker["y_pred"].values
+
+    rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
+    mae = np.mean(np.abs(y_true - y_pred))
+    da = np.mean(np.sign(y_true) == np.sign(y_pred)) * 100
+
+    rolling_std = pd.Series(y_pred).rolling(20).std().fillna(
+        pd.Series(y_pred).std()
+    ).values
+    position = np.clip(y_pred / (rolling_std + 1e-8), -2, 2)
+    strategy_return = y_true * position
+    sharpe = (np.mean(strategy_return) /
+              (np.std(strategy_return) + 1e-8)) * np.sqrt(252)
+
+    return rmse, mae, da, sharpe
 
 
-def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument(
-        "--data",
-        type=Path,
-        default=ROOT / "data" / "raw" / "JPM_raw.csv",
-    )
-    p.add_argument(
-        "--checkpoint",
-        type=Path,
-        default=ROOT / "checkpoints" / "best.pt",
-    )
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    args = p.parse_args()
-
-    if not args.data.is_file():
-        raise SystemExit(f"Missing {args.data}")
-    if not args.checkpoint.is_file():
-        raise SystemExit(f"Missing {args.checkpoint}")
-
-    if args.checkpoint.suffix in (".joblib", ".pkl", ".pickle"):
-        blob = joblib.load(args.checkpoint)
-    else:
-        try:
-            blob = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-        except TypeError:
-            blob = torch.load(args.checkpoint, map_location="cpu")
-
-    if isinstance(blob, dict) and "model" in blob and hasattr(blob["model"], "predict_proba"):
-        cfg = blob.get("feature_config")
-        if cfg is None:
-            raise SystemExit("Checkpoint missing feature_config")
-        ds = build_dataset_from_csv(args.data, cfg)
-        X_te = last_timestep(ds["X"][ds["test_idx"]])
-        y_te = ds["y"][ds["test_idx"]]
-        ev = evaluate_classifier(blob["model"], X_te, y_te)
-        print(ev)
+def main():
+    path = "results/xgboost_predictions.csv"
+    if not os.path.exists(path):
+        print(f"[ERROR] {path} not found. Run models/baseline_xgboost.py first.")
         return
 
-    cfg = blob["feature_config"]
-    ds = build_dataset_from_csv(args.data, cfg)
-    X_te = ds["X"][ds["test_idx"]]
-    y_te = ds["y"][ds["test_idx"]]
-    device = torch.device(args.device)
+    df = pd.read_csv(path)
+    tickers = df["Ticker"].unique()
 
-    kind = blob.get("kind", "ramt")
-    fdim = int(blob["input_dim"])
+    print(f"\n{'Ticker':<15} {'RMSE':>8} {'MAE':>8} {'DA%':>8} {'Sharpe':>8}")
+    print("-" * 55)
 
-    if kind == "lstm":
-        m = init_lstm(fdim)
-    else:
-        m = RegimeAdaptiveTransformer(input_dim=fdim)
+    all_metrics = []
+    for ticker in tickers:
+        subset = df[df["Ticker"] == ticker]
+        rmse, mae, da, sharpe = compute_metrics(subset)
+        all_metrics.append([rmse, mae, da, sharpe])
+        print(f"{ticker:<15} {rmse:>8.4f} {mae:>8.4f} {da:>8.2f} {sharpe:>8.2f}")
 
-    m.load_state_dict(blob["state_dict"])
-    m.to(device)
-    m.eval()
-    with torch.no_grad():
-        x = torch.from_numpy(X_te).to(device)
-        if isinstance(m, RegimeAdaptiveTransformer):
-            logits, _, _ = m(x)
-        else:
-            logits = m(x)
-        proba = torch.sigmoid(logits).cpu().numpy()
-    print(report_metrics(y_te, proba))
+    avg = np.mean(all_metrics, axis=0)
+    print("-" * 55)
+    print(f"{'Average':<15} {avg[0]:>8.4f} {avg[1]:>8.4f} "
+          f"{avg[2]:>8.2f} {avg[3]:>8.2f}")
+
+    out = "results/baseline_results.csv"
+    rows = []
+    for ticker, m in zip(tickers, all_metrics):
+        rows.append({"Ticker": ticker, "RMSE": m[0], "MAE": m[1],
+                     "DA%": m[2], "Sharpe": m[3]})
+    pd.DataFrame(rows).to_csv(out, index=False)
+    print(f"\nSaved → {out}")
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ checkpoints/*.joblib
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb_checkpoints
+eda/eda_executed.ipynb
 
 # OS
 .DS_Store

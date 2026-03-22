@@ -19,10 +19,7 @@ regime-adaptive-transformer/
 ├── models/
 │   ├── baseline_xgboost.py  ← XGBoost walk-forward baseline
 │   ├── baseline_lstm.py     ← LSTM baseline (in progress)
-│   └── ramt/
-│       ├── encoder.py       ← multimodal feature encoders
-│       ├── moe.py           ← mixture of experts gating
-│       └── model.py         ← full RAMT architecture
+│   └── ramt/          ← Phase 2 (planned)
 ├── results/
 │   └── xgboost_predictions.csv  ← out-of-sample predictions
 ├── evaluate.py              ← metrics and results table
@@ -36,6 +33,7 @@ regime-adaptive-transformer/
 | RELIANCE.NS | Indian Energy/Conglomerate | NSE |
 | TCS.NS | Indian IT Services | NSE |
 | HDFCBANK.NS | Indian Banking | NSE |
+| EPIGRAL.NS | Indian Small-Cap Chemicals | NSE |
 
 ## Quickstart
 ### 1. Install dependencies
@@ -66,11 +64,12 @@ python models/baseline_xgboost.py
 ## Baseline Results (XGBoost, walk-forward validation)
 | Ticker | RMSE | MAE | DA% | Sharpe |
 |--------|------|-----|-----|--------|
-| JPM | 0.0194 | 0.0127 | 51.81 | 0.45 |
-| RELIANCE.NS | 0.0180 | 0.0121 | 51.59 | 0.50 |
-| TCS.NS | 0.0151 | 0.0107 | 49.27 | 0.04 |
-| HDFCBANK.NS | 0.0164 | 0.0110 | 51.52 | 0.21 |
-| **Average** | **0.0173** | **0.0116** | **51.05** | **0.30** |
+| JPM | 0.0194 | 0.0127 | 52.13 | 0.52 |
+| RELIANCE.NS | 0.0180 | 0.0121 | 52.25 | 0.54 |
+| TCS.NS | 0.0151 | 0.0106 | 53.44 | 0.82 |
+| HDFCBANK.NS | 0.0165 | 0.0111 | 51.52 | 0.04 |
+| EPIGRAL.NS | 0.0243 | 0.0166 | 51.32 | -0.56 |
+| **Average** | **0.0187** | **0.0126** | **52.13** | **0.27** |
 
 ## Feature Groups
 | Group | Features | Purpose |
