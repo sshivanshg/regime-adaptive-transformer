@@ -7,6 +7,7 @@ on out-of-sample predictions for all 4 tickers.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,7 @@ FEATURE_FILES = [
     ("RELIANCE_NS", "RELIANCE_NS_features.csv"),
     ("TCS_NS", "TCS_NS_features.csv"),
     ("HDFCBANK_NS", "HDFCBANK_NS_features.csv"),
+    ("EPIGRAL_NS", "EPIGRAL_NS_features.csv"),
 ]
 
 EXCLUDE_FROM_X = {
@@ -176,6 +178,20 @@ def walk_forward_predict(
     if n0 < 50 or n0 + TEST_DAYS > n:
         raise ValueError(f"{ticker}: insufficient rows (n={n}, n0={n0})")
 
+    train_end_probe = n0
+    total_folds = 0
+    while train_end_probe + TEST_DAYS <= n:
+        total_folds += 1
+        train_end_probe += TEST_DAYS
+
+    print(f"=== WALK-FORWARD {ticker} ===")
+    print(f"Initial train size: {n0}")
+    print(f"Step size (train_end advance): {TEST_DAYS} trading days")
+    print(f"Test window per fold: {TEST_DAYS} trading days")
+    print(f"STEP_DAYS constant: {STEP_DAYS} (must match step if used elsewhere)")
+    print(f"Total folds: {total_folds}")
+    print(f"XGB random_state: {XGB_PARAMS.get('random_state')}")
+
     oos_dates: list = []
     oos_y_true: list = []
     oos_y_pred: list = []
@@ -286,21 +302,34 @@ def sharpe_ratio(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 def main() -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
+    data_raw: dict[str, pd.DataFrame] = {}
+    for ticker, fname in FEATURE_FILES:
+        path = PROCESSED_DIR / fname
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        print(f"Loading from: {os.path.abspath(path)}")
+        data_raw[ticker] = pd.read_csv(path, parse_dates=["Date"])
+
+    print("=== DATA LOADED ===")
+    for ticker, df in data_raw.items():
+        print(
+            f"{ticker}: {len(df)} rows, date range: {df['Date'].min()} → {df['Date'].max()}"
+        )
+
     all_rows: list[dict] = []
     metrics_rows: list[tuple[str, float, float, float, float]] = []
     top_features_by_ticker: dict[str, list[str]] = {}
 
     for ticker, fname in FEATURE_FILES:
-        path = PROCESSED_DIR / fname
-        if not path.is_file():
-            raise FileNotFoundError(path)
-
-        raw = pd.read_csv(path, parse_dates=["Date"])
+        raw = data_raw[ticker]
         X, y, dates, regime = prepare_xy(raw)
         n = len(X)
         n0 = int(n * INITIAL_TRAIN_FRAC)
         selected = select_top_features(X, y, n0)
         top_features_by_ticker[ticker] = selected
+        print("=== FEATURES USED ===")
+        print(f"{ticker} — number of features: {len(selected)}")
+        print(f"Feature columns: {selected}")
         X = X[selected]
 
         dates_oos, y_true, y_pred = walk_forward_predict(

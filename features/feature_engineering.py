@@ -30,6 +30,7 @@ RAW_FILES = [
     "RELIANCE_NS_raw.csv",
     "TCS_NS_raw.csv",
     "HDFCBANK_NS_raw.csv",
+    "EPIGRAL_NS_raw.csv",
 ]
 
 LAG_DAYS = [1, 2, 3, 5, 10, 20]

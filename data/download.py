@@ -1,7 +1,8 @@
 """
 RAMT Data Pipeline — Step 1: Download
-Downloads OHLCV data for JPM, RELIANCE.NS, TCS.NS, HDFCBANK.NS
-and benchmark indices (NIFTY50, S&P500) from 2010-01-01 to 2026-01-01.
+Downloads OHLCV for configured tickers (JPM, RELIANCE.NS, TCS.NS, HDFCBANK.NS,
+EPIGRAL.NS) and benchmark indices (NIFTY50, S&P500). Default period 2010-01-01 to
+2026-01-01; EPIGRAL.NS uses the last 10 years before END_DATE (see TICKER_DATE_OVERRIDES).
 Saves raw CSVs to data/raw/.
 """
 
@@ -17,7 +18,13 @@ import yfinance as yf
 # Configuration
 # -----------------------------------------------------------------------------
 
-TICKERS: list[str] = ["JPM", "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS"]
+TICKERS: list[str] = [
+    "JPM",
+    "RELIANCE.NS",
+    "TCS.NS",
+    "HDFCBANK.NS",
+    "EPIGRAL.NS",  # Epigral Limited (NSE); ~10-year window via TICKER_DATE_OVERRIDES
+]
 # Broad-market benchmarks for cross-asset EDA (Yahoo symbol → filename stem in data/raw/)
 BENCHMARK_INDICES: list[tuple[str, str]] = [
     ("^NSEI", "NIFTY50"),  # NIFTY 50
@@ -25,6 +32,11 @@ BENCHMARK_INDICES: list[tuple[str, str]] = [
 ]
 START_DATE = "2010-01-01"
 END_DATE = "2026-01-01"
+# Per-symbol date range (others use START_DATE / END_DATE). Epigral: last 10 years only.
+_EPIGRAL_START = (pd.Timestamp(END_DATE) - pd.DateOffset(years=10)).strftime("%Y-%m-%d")
+TICKER_DATE_OVERRIDES: dict[str, tuple[str, str]] = {
+    "EPIGRAL.NS": (_EPIGRAL_START, END_DATE),
+}
 RAW_DIR = Path(__file__).resolve().parent / "raw"
 OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume"]
 
@@ -339,7 +351,8 @@ def main() -> None:
     summary_rows: list[dict[str, object]] = []
 
     for ticker in TICKERS:
-        df = download_one_ticker(ticker, START_DATE, END_DATE)
+        t0, t1 = TICKER_DATE_OVERRIDES.get(ticker, (START_DATE, END_DATE))
+        df = download_one_ticker(ticker, t0, t1)
         print_ticker_diagnostics(ticker, df)
 
         if df.empty:
