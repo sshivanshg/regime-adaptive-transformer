@@ -184,8 +184,8 @@ def walk_forward_predict(
         total_folds += 1
         train_end_probe += TEST_DAYS
 
-    print(f"=== WALK-FORWARD {ticker} ===")
-    print(f"Initial train size: {n0}")
+    print(f"WALK-FORWARD {ticker}")
+    print(f"Initial training size: {n0}")
     print(f"Step size (train_end advance): {TEST_DAYS} trading days")
     print(f"Test window per fold: {TEST_DAYS} trading days")
     print(f"STEP_DAYS constant: {STEP_DAYS} (must match step if used elsewhere)")
