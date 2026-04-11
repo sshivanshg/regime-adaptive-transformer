@@ -1,6 +1,8 @@
 # Regime-Adaptive Multimodal Transformer (RAMT)
 > Short-term equity return forecasting with regime-aware deep learning
 
+**Concepts & glossary (living notes):** [RAMT_CONCEPTS_README.md](RAMT_CONCEPTS_README.md)
+
 ## Overview
 This project forecasts short-horizon equity returns using daily OHLCV data from **US** (JPM) and **Indian** NSE listings (Reliance, TCS, HDFC Bank). It combines **HMM-based regime detection** on returns and volatility with a **mixture-of-experts (MoE)** transformer architecture and **transfer learning** across markets—so predictions adapt when volatility clusters and correlations shift, rather than assuming a single static data-generating process.
 
