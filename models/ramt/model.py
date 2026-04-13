@@ -31,7 +31,7 @@ except ModuleNotFoundError:
     )
 
 # Hyperparameters and constants
-TOTAL_FEATURES = 27
+TOTAL_FEATURES = len(ALL_FEATURE_COLS)
 SEQUENCE_LENGTH = 30
 NUM_REGIMES = 3
 GROUP_DIM = 32
@@ -122,7 +122,7 @@ class RAMTModel(nn.Module):
     def forward(self, x, regime_labels_one_hot):
         """
         Args:
-            x: (batch, seq_len, total_features=27)
+            x: (batch, seq_len, total_features=TOTAL_FEATURES)
             regime_labels_one_hot: one-hot (batch, num_regimes), or integer labels
         Returns:
             prediction: (batch, 1)

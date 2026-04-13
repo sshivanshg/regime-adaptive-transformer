@@ -1,5 +1,3 @@
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,6 +26,11 @@ class PositionalEncoding(nn.Module):
     def forward(self, x):
         # x: (batch, seq_len, embed_dim)
         batch_size, seq_len, _ = x.shape
+        if seq_len > self.pos_embedding.num_embeddings:
+            raise ValueError(
+                "Input sequence length exceeds positional embedding capacity: "
+                f"got seq_len={seq_len}, max_supported={self.pos_embedding.num_embeddings}"
+            )
         positions = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(
             batch_size, -1
         )
@@ -176,6 +179,7 @@ class GatingNetwork(nn.Module):
             # regime 2 -> [0, 0, 1]
             regime_onehot = F.one_hot(regime.long(), num_classes=self.num_regimes).float()
         # regime_onehot: (batch, num_regimes)
+        regime_onehot = regime_onehot.to(context.device)
 
         # Concatenate context with regime
         gate_input = torch.cat([context, regime_onehot], dim=-1)
