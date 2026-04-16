@@ -18,7 +18,7 @@ import torch.nn as nn
 
 from models.ramt.dataset import ALL_FEATURE_COLS
 from models.ramt.encoder import MultimodalEncoder
-from models.ramt.moe import MixtureOfExperts, PositionalEncoding
+from models.ramt.moe import MixtureOfExperts, PositionalEncoding, RegimeCrossAttention
 
 
 class RAMTModel(nn.Module):
@@ -97,6 +97,13 @@ class RAMTModel(nn.Module):
             dropout=dropout,
         )
 
+        self.regime_attn = RegimeCrossAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            num_regimes=num_regimes,
+            dropout=dropout,
+        )
+
         # Step 3: Mixture of Experts (returns fused context embedding)
         self.moe = MixtureOfExperts(
             embed_dim=embed_dim,
@@ -147,6 +154,8 @@ class RAMTModel(nn.Module):
         # So Transformer knows Day 1 from Day 30
         positioned = self.pos_encoding(encoded)
         # positioned: (batch, seq_len, embed_dim=64)
+
+        positioned = self.regime_attn(positioned, regime)
 
         # Step 3: Route through regime-specialized experts -> context embedding
         context, gate_weights = self.moe(positioned, regime)

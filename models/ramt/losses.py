@@ -68,3 +68,54 @@ class CombinedLoss(nn.Module):
         dir_loss = self.directional(y_pred, y_true)
         total = mse_loss + self.lambda_dir * dir_loss
         return total, mse_loss, dir_loss
+
+
+class TournamentRankingLoss(nn.Module):
+    """
+    Full cross-sectional pairwise margin ranking with magnitude weighting.
+
+    For every pair (i, j) with y_true[i] > y_true[j]:
+        pair_loss = ReLU(margin - (pred[i] - pred[j])) * (y_true[i] - y_true[j])
+
+    The (y_true[i] - y_true[j]) weight makes the tournament focus on the
+    high-stakes matchups (large alpha spreads) — the trades that actually
+    drive portfolio P&L. This replaces the prior top-k vs bottom-k scheme
+    which dropped ~99% of the pairs and left the middle of the cross-section
+    with zero gradient signal (a root cause of the pessimism bias).
+
+    Args:
+        margin: minimum required gap between pred[i] and pred[j] in UNSCALED
+                alpha units (e.g. 0.02 = 2% monthly-alpha gap). Set based on
+                the natural spread of the cross-section, not the RobustScaler
+                transformed target.
+
+    Input:
+        pred:   (N,) or (N, 1)  — model scores for N cross-sectional items
+        y_true: (N,) or (N, 1)  — true alpha, ideally in native % units
+
+    Output: scalar loss
+    """
+
+    def __init__(self, margin: float = 0.02):
+        super().__init__()
+        self.margin = float(margin)
+
+    def forward(self, pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        p = pred.reshape(-1)
+        y = y_true.reshape(-1)
+        N = y.shape[0]
+        if N < 2:
+            return torch.zeros((), device=pred.device, dtype=pred.dtype)
+
+        # Pairwise diffs: entry [i, j] = value[i] - value[j]
+        y_diff = y.unsqueeze(1) - y.unsqueeze(0)  # (N, N)
+        p_diff = p.unsqueeze(1) - p.unsqueeze(0)  # (N, N)
+
+        # Keep only ordered pairs where y[i] > y[j] (avoid double-counting + self pairs)
+        mask = (y_diff > 0).float()
+        weight = y_diff.abs() * mask               # magnitude weight
+        hinge = F.relu(self.margin - p_diff)       # penalize pred gaps < margin
+
+        num = (hinge * weight).sum()
+        den = weight.sum() + 1e-8
+        return num / den

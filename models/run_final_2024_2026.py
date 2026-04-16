@@ -1,8 +1,8 @@
 """
 Final split runner (no future leakage)
 
-Train: 2015-01-01 … 2022-12-31 (history used to fit scalers + model).
-Blind test / backtest: 2023-01-01 … 2026-04-15 (held out from scaler fitting).
+Train: 2020-01-01 … 2022-12-31 (history used to fit scalers + model).
+Blind test / backtest: 2024-01-01 … 2026-04-16 (held out from scaler fitting).
 
 Walk-forward: **retrain** every ``training_step`` (default 126 trading days ≈ 6 months);
 **inference / portfolio rebalance** every ``rebalance_step`` (default 21 days). Inference
@@ -134,10 +134,10 @@ def main() -> None:
     os.makedirs(ROOT / "results", exist_ok=True)
 
     # Strict blind split (matches train_ranking.py)
-    train_start = "2015-01-01"
+    train_start = "2020-01-01"
     train_end = "2022-12-31"
-    test_start = "2023-01-01"
-    test_end = "2026-04-15"
+    test_start = "2024-01-01"
+    test_end = "2026-04-16"
 
     preds_path = (
         Path(args.predictions)

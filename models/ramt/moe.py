@@ -145,6 +145,67 @@ class ExpertTransformer(nn.Module):
         return out
 
 
+class RegimeCrossAttention(nn.Module):
+    """
+    Regime-as-Query cross-attention block.
+
+    Regime acts as the Query; the fused feature sequence acts as Key/Value.
+    This lets the HMM regime dynamically reweight WHICH features matter
+    at each timestep, instead of being treated as just another modality
+    concatenated in the encoder.
+
+    Intuition:
+        - In BULL regime, the learned prototype attends to momentum features
+          (Ret_21d, Volume_Surge).
+        - In BEAR, it attends to mean-reversion signals (RSI_14, BB_Dist).
+        - In HIGH_VOL, it attends to macro risk proxies (INDIAVIX, USDINR).
+
+    Input:
+        features: (B, T, D) post-encoder, pre-MoE sequence embedding
+        regime:   (B,) integer regime label, or (B, 1)
+
+    Output:
+        (B, T, D) regime-contextualized sequence (residual + FFN block).
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 64,
+        num_heads: int = 4,
+        num_regimes: int = 3,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.num_regimes = int(num_regimes)
+        self.regime_query = nn.Embedding(self.num_regimes, embed_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, 2 * embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(2 * embed_dim, embed_dim),
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
+
+    def forward(self, features: torch.Tensor, regime: torch.Tensor) -> torch.Tensor:
+        B, T, D = features.shape
+        # Normalize regime to integer (B,)
+        if regime.dim() > 1:
+            regime = regime.squeeze(-1)
+        q = self.regime_query(regime.long())        # (B, D)
+        q = q.unsqueeze(1).expand(B, T, D)           # (B, T, D)
+        ctx, _ = self.cross_attn(query=q, key=features, value=features)
+        x = self.norm(features + ctx)                # residual 1 (attention)
+        x = self.norm2(x + self.ffn(x))              # residual 2 (FFN)
+        return x
+
+
 class GatingNetwork(nn.Module):
     """
     Computes soft routing weights over N experts.

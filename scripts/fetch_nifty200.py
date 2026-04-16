@@ -4,7 +4,7 @@ Fetch NIFTY 200 universe + macro indicators and save as Parquet.
 Requirements implemented:
 - Pull official NIFTY 200 constituents CSV from NSE archives.
 - Convert equity symbols to Yahoo Finance tickers by appending ".NS".
-- Download daily OHLCV + Adj Close from 2015-01-01 to 2026-04-15 (inclusive end handled).
+- Download daily OHLCV + Adj Close from 2020-01-01 to 2026-04-15 (inclusive end handled).
 - Also download: ^INDIAVIX, CL=F, INR=X, ^GSPC.
 - Rate limit: sleep(0.5) between tickers.
 - Storage: write one parquet per series under data/raw/ (no 200 CSVs).
@@ -25,7 +25,7 @@ import yfinance as yf
 
 NSE_NIFTY200_CSV_URL = "https://archives.nseindia.com/content/indices/ind_nifty200list.csv"
 
-START_DATE = "2015-01-01"
+START_DATE = "2020-01-01"
 # User requirement is inclusive through 2026-04-15; yfinance `end` is exclusive.
 END_DATE_EXCLUSIVE = "2026-04-16"
 

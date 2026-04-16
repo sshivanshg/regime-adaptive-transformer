@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Union
 
 import matplotlib
 
@@ -36,7 +37,7 @@ from models.ramt.dataset import (
     TICKER_TO_ID,
     build_ticker_universe,
 )
-from models.ramt.losses import CombinedLoss
+from models.ramt.losses import CombinedLoss, TournamentRankingLoss
 from models.ramt.model import build_ramt
 def _winsorize_with_bounds(y: np.ndarray, lo: float, hi: float) -> np.ndarray:
     """
@@ -76,6 +77,7 @@ def _apply_y_scaler(data: dict[str, TickerData], y_scaler: RobustScaler) -> dict
             y_monthly_raw=td.y_monthly_raw,
             y_daily_raw=td.y_daily_raw,
             regime=td.regime,
+            sector=getattr(td, "sector", "OTHER"),
         )
     return out
 
@@ -112,6 +114,19 @@ MODEL_DROPOUT = 0.2
 HIGH_VOL_SAMPLE_WEIGHT = 2.0  # regime 0
 # MarginRankingLoss margin: higher → model must separate leaders from the pack more aggressively.
 RANKING_MARGIN = 3.0
+
+# --- Pessimism-bias fix (plan: eager-rolling-sphinx) -----------------------
+# See /Users/shivanshgupta/.claude/plans/eager-rolling-sphinx.md for the
+# mathematical defect summary that motivated these knobs.
+USE_TOURNAMENT_LOSS = True            # full-pairwise magnitude-weighted ranking
+# Margin in unscaled monthly-alpha units (winsorized % space); paired with inverse-scaled preds.
+RANKING_MARGIN_ALPHA = 0.02
+AUX_DAILY_WEIGHT = 0.05               # tiny MSE anchor on daily head (was 0.3)
+MIN_CROSSSECTION_SIZE = 8             # min stocks/date for ranking loss (was 4)
+
+# --- Sector-neutral scaling (plan: Upgrade 3 / D3) -------------------------
+# "sector" = per-sector RobustScaler with global fallback; "global" = legacy
+SCALER_MODE = "sector"
 
 
 def _safe_ticker_from_filename(fname: str) -> str:
@@ -180,7 +195,7 @@ def _train_ramt_combined_fold(
     plot_dir: str | None,
     save_artifacts: bool,
     fold_label: str,
-) -> tuple[object, RobustScaler, RobustScaler, float, float]:
+) -> tuple[object, Union[RobustScaler, "SectorNeutralScaler"], RobustScaler, float, float]:
     """
     Fit scaler + y transforms on training keys only, then train RAMT (train + val loaders).
     """
@@ -188,6 +203,8 @@ def _train_ramt_combined_fold(
     val_start = (pd.Timestamp(train_end_inclusive) - pd.DateOffset(months=6)).strftime("%Y-%m-%d")
     val_keys = _build_sample_keys_from_store(store, tickers, val_start, train_end_inclusive, SEQ_LEN)
     train_keys_final = [k for k in train_keys if k not in set(val_keys)]
+
+    from features.sectors import get_sector
 
     data_sc: dict[str, TickerData] = {}
     for t in tickers:
@@ -202,6 +219,7 @@ def _train_ramt_combined_fold(
             y_monthly_raw=td["y_m"],  # type: ignore[arg-type]
             y_daily_raw=td["y_d"],  # type: ignore[arg-type]
             regime=td["r"],  # type: ignore[arg-type]
+            sector=get_sector(t),
         )
 
     if len(train_keys_final) < 100:
@@ -210,7 +228,10 @@ def _train_ramt_combined_fold(
             f"train_end_inclusive={train_end_inclusive}"
         )
 
-    scaler = _fit_scaler_on_train(data_sc, train_keys_final)
+    if SCALER_MODE == "sector":
+        scaler = _fit_sector_neutral_scaler_on_train(data_sc, train_keys_final)
+    else:
+        scaler = _fit_scaler_on_train(data_sc, train_keys_final)
 
     y_train_raw = np.asarray(
         [float(data_sc[t].y_monthly_raw[i]) for t, i in train_keys_final], dtype=np.float32
@@ -230,6 +251,7 @@ def _train_ramt_combined_fold(
             y_monthly_raw=y_raw_w,
             y_daily_raw=td.y_daily_raw,
             regime=td.regime,
+            sector=td.sector,
         )
     data_sc = patched_w
 
@@ -284,8 +306,10 @@ def _train_ramt_combined_fold(
     best_state = None
     patience_ctr = 0
     for epoch in range(n_epochs):
-        tr_m = _train_one_epoch(model, train_loader, optimizer, criterion, global_step=global_step)
-        v = _eval_loss(model, val_loader, criterion)
+        tr_m = _train_one_epoch(
+            model, train_loader, optimizer, criterion, global_step=global_step, y_scaler=y_scaler
+        )
+        v = _eval_loss(model, val_loader, criterion, y_scaler=y_scaler)
         if global_step[0] >= WARMUP_STEPS:
             plateau.step(v)
         lr_now = float(optimizer.param_groups[0]["lr"])
@@ -330,7 +354,7 @@ def _predict_rows_for_dates(
     store: LazyTickerStore,
     tickers: list[str],
     model: object,
-    scaler: RobustScaler,
+    scaler: Union[RobustScaler, "SectorNeutralScaler"],
     y_scaler: RobustScaler,
     lo_b: float,
     hi_b: float,
@@ -352,6 +376,10 @@ def _predict_rows_for_dates(
             if i < min_i:
                 continue
             X_raw = td["X"][i - SEQ_LEN : i]
+            if hasattr(scaler, "set_active_sector"):
+                from features.sectors import get_sector
+
+                scaler.set_active_sector(get_sector(t))
             Xseq = (
                 torch.from_numpy(scaler.transform(X_raw.astype(np.float64)).astype(np.float32))
                 .float()
@@ -388,6 +416,7 @@ class TickerData:
     y_monthly_raw: np.ndarray  # (N,) float32 (unscaled, clipped)
     y_daily_raw: np.ndarray  # (N,) float32 (unscaled)
     regime: np.ndarray  # (N,) int64
+    sector: str = "OTHER"
 
 
 class MultiTickerSequenceDataset(LazyMultiTickerSequenceDataset):
@@ -447,9 +476,104 @@ def _fit_scaler_on_train(
     return scaler
 
 
-def _apply_scaler(data: dict[str, TickerData], scaler: RobustScaler) -> dict[str, TickerData]:
+class SectorNeutralScaler:
+    """
+    Per-sector RobustScaler with a global fallback for small/unknown sectors.
+
+    Rationale: a 1σ RSI swing in BANK should be comparable to a 1σ swing in IT.
+    Pooling them (as the legacy global scaler does) compresses high-vol sectors
+    and amplifies low-vol ones — the sector-alpha-washout defect (D3 in plan).
+
+    The fit requires a companion `sectors` array aligned with `X` rows. Lookup
+    of sector-for-ticker is resolved via features.sectors.get_sector.
+
+    Intended to be ``sklearn``-API compatible enough for drop-in use in
+    LazyMultiTickerSequenceDataset — exposes ``.transform(X)`` that routes
+    by the currently-loaded ticker's sector (set via ``set_active_sector``).
+    """
+
+    def __init__(self, min_samples_per_sector: int = 500):
+        self.min_samples_per_sector = int(min_samples_per_sector)
+        self.per_sector: dict[str, RobustScaler] = {}
+        self.global_fallback: RobustScaler = RobustScaler()
+        self._active_sector: str | None = None
+
+    # --- fit / route --------------------------------------------------------
+    def fit(self, X: np.ndarray, sectors: np.ndarray) -> "SectorNeutralScaler":
+        X = np.asarray(X, dtype=np.float32)
+        sectors = np.asarray(sectors)
+        if X.shape[0] == 0:
+            self.global_fallback.fit(np.empty((0, X.shape[1] if X.ndim == 2 else 1),
+                                              dtype=np.float32))
+            return self
+        self.global_fallback.fit(X)
+        for sec in np.unique(sectors):
+            mask = sectors == sec
+            if int(mask.sum()) >= self.min_samples_per_sector:
+                sc = RobustScaler()
+                sc.fit(X[mask])
+                self.per_sector[str(sec)] = sc
+        return self
+
+    def set_active_sector(self, sector: str | None) -> None:
+        """Route ``.transform`` calls to a specific sector's scaler."""
+        self._active_sector = sector
+
+    # --- sklearn-style transform -------------------------------------------
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        """
+        Transform X using the currently-active sector scaler. Falls back to
+        the global scaler if the sector is unknown or under-sampled.
+        """
+        sc = self.per_sector.get(str(self._active_sector), self.global_fallback) \
+            if self._active_sector is not None else self.global_fallback
+        return sc.transform(X)
+
+    def transform_for_sector(self, X: np.ndarray, sector: str) -> np.ndarray:
+        sc = self.per_sector.get(str(sector), self.global_fallback)
+        return sc.transform(X)
+
+
+def _fit_sector_neutral_scaler_on_train(
+    data: dict[str, TickerData],
+    train_keys: list[tuple[str, int]],
+    max_fit_samples: int = 200_000,
+) -> SectorNeutralScaler:
+    """
+    Sector-neutral variant of _fit_scaler_on_train.
+
+    Requires ``TickerData`` to carry a ``.sector`` attribute; ``get_sector``
+    resolves it from the ticker stem when not populated.
+    """
+    from features.sectors import get_sector
+
+    scaler = SectorNeutralScaler()
+    if len(train_keys) == 0:
+        scaler.fit(np.empty((0, len(ALL_FEATURE_COLS)), dtype=np.float32),
+                   np.empty((0,), dtype=object))
+        return scaler
+
+    step = max(1, int(len(train_keys) / max_fit_samples))
+    chosen = train_keys[::step]
+    Xb_list: list[np.ndarray] = []
+    sec_list: list[str] = []
+    for t, i in chosen:
+        td = data[t]
+        Xb_list.append(td.X[i])
+        sec_list.append(getattr(td, "sector", None) or get_sector(t))
+    Xb = np.asarray(Xb_list, dtype=np.float32)
+    sec_arr = np.asarray(sec_list, dtype=object)
+    scaler.fit(Xb, sec_arr)
+    return scaler
+
+
+def _apply_scaler(
+    data: dict[str, TickerData], scaler: Union[RobustScaler, "SectorNeutralScaler"]
+) -> dict[str, TickerData]:
     out: dict[str, TickerData] = {}
     for t, td in data.items():
+        if hasattr(scaler, "set_active_sector"):
+            scaler.set_active_sector(str(td.sector))
         Xs = scaler.transform(td.X).astype(np.float32)
         out[t] = TickerData(
             ticker=td.ticker,
@@ -461,6 +585,7 @@ def _apply_scaler(data: dict[str, TickerData], scaler: RobustScaler) -> dict[str
             y_monthly_raw=td.y_monthly_raw,
             y_daily_raw=td.y_daily_raw,
             regime=td.regime,
+            sector=td.sector,
         )
     return out
 
@@ -591,6 +716,66 @@ def _lambdarank_loss(pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
     return loss
 
 
+_TOURNAMENT = TournamentRankingLoss(margin=RANKING_MARGIN_ALPHA)
+
+
+def _monthly_pred_unscaled(pred_m: torch.Tensor, y_scaler: RobustScaler) -> torch.Tensor:
+    """Map RobustScaler monthly target space back to winsorized % alpha units (differentiable)."""
+    s = torch.as_tensor(
+        np.asarray(y_scaler.scale_, dtype=np.float32).ravel()[0],
+        device=pred_m.device,
+        dtype=pred_m.dtype,
+    )
+    c = torch.as_tensor(
+        np.asarray(y_scaler.center_, dtype=np.float32).ravel()[0],
+        device=pred_m.device,
+        dtype=pred_m.dtype,
+    )
+    return pred_m.squeeze(-1) * s + c
+
+
+def _rank_term(
+    pred_m: torch.Tensor,
+    yb_m_scaled: torch.Tensor,
+    yb_m_unscaled: torch.Tensor,
+    y_scaler: RobustScaler,
+) -> torch.Tensor:
+    """
+    One rebalance-date ranking loss: tournament on unscaled alpha vs legacy margin on scaled targets.
+    """
+    if USE_TOURNAMENT_LOSS:
+        pu = _monthly_pred_unscaled(pred_m, y_scaler)
+        return _TOURNAMENT(pu.unsqueeze(-1), yb_m_unscaled.unsqueeze(-1))
+    return _margin_rank_loss(pred_m, yb_m_scaled, margin=RANKING_MARGIN)
+
+
+def _log_pred_dist(
+    pred: torch.Tensor,
+    y: torch.Tensor,
+    tag: str,
+) -> None:
+    """
+    Pessimism-bias diagnostic. Prints μ/σ of predictions vs targets and their
+    correlation. Fires the alarm when predicted mean collapses toward 0 while
+    actual mean is meaningfully positive (the 2024-2026 rally scenario).
+    """
+    with torch.no_grad():
+        p = pred.detach().cpu().numpy().ravel()
+        t = y.detach().cpu().numpy().ravel()
+        if p.size == 0 or t.size == 0:
+            return
+        cov = float(np.corrcoef(p, t)[0, 1]) if p.size >= 2 and p.std() > 0 and t.std() > 0 else 0.0
+        alarm = ""
+        if abs(t.mean()) > 1e-4 and abs(p.mean()) < 0.3 * abs(t.mean()):
+            alarm = "  ⚠ PESSIMISM-ALARM"
+        print(
+            f"[{tag}] pred μ={p.mean():+.4f} σ={p.std():.4f}  "
+            f"actual μ={t.mean():+.4f} σ={t.std():.4f}  "
+            f"corr={cov:+.3f}{alarm}",
+            flush=True,
+        )
+
+
 def _train_one_epoch(
     model,
     loader,
@@ -598,12 +783,15 @@ def _train_one_epoch(
     criterion,
     lambda_rank: float = 0.2,
     global_step: list[int] | None = None,
+    y_scaler: RobustScaler | None = None,
 ):
     model.train()
     total = 0.0
     n = 0
+    pred_accum: list[torch.Tensor] = []
+    actual_accum: list[torch.Tensor] = []
     pbar = tqdm(loader, desc="train", leave=False, mininterval=0.5)
-    for Xb, yb_m, yb_d, rb, tb, db in pbar:
+    for Xb, yb_m, yb_d, rb, tb, db, yb_m_raw in pbar:
         if global_step is not None and global_step[0] < WARMUP_STEPS:
             lr = WARMUP_LR_START + (WARMUP_LR_END - WARMUP_LR_START) * (
                 global_step[0] + 1
@@ -613,6 +801,7 @@ def _train_one_epoch(
 
         Xb = Xb.to(DEVICE)
         yb_m = yb_m.to(DEVICE)
+        yb_m_raw = yb_m_raw.to(DEVICE).squeeze(-1)
         yb_d = yb_d.to(DEVICE)
         rb = rb.squeeze(-1).to(DEVICE)
         tb = tb.squeeze(-1).to(DEVICE)
@@ -621,36 +810,34 @@ def _train_one_epoch(
         optimizer.zero_grad()
         pred_m, pred_d, _ = model(Xb, rb, ticker_id=tb)
 
-        # Strategic loss (monthly ranking)
-        # Primary = ranking loss (order matters more than exact value).
         time_w = _time_decay_weights(db).to(dtype=torch.float32)
-        rank_losses = []
-        rank_w = []
+        rank_losses: list[torch.Tensor] = []
+        rank_w: list[torch.Tensor] = []
+        assert y_scaler is not None
         for d in torch.unique(db):
             m = db == d
-            if int(m.sum()) >= 4:
+            if int(m.sum()) >= MIN_CROSSSECTION_SIZE:
                 gw = time_w[m].mean().clamp_min(1e-8)
-                rank_losses.append(_margin_rank_loss(pred_m[m], yb_m[m], margin=RANKING_MARGIN) * gw)
+                rank_losses.append(
+                    _rank_term(pred_m[m], yb_m[m], yb_m_raw[m], y_scaler) * gw
+                )
                 rank_w.append(gw)
         if rank_losses:
             rank_loss = torch.stack(rank_losses).sum() / (torch.stack(rank_w).sum() + 1e-8)
         else:
             rank_loss = torch.tensor(0.0, device=DEVICE)
 
-        # Regime weighting: emphasize high-vol (regime=0) samples
         w = torch.ones_like(rb, dtype=torch.float32, device=DEVICE)
         w = torch.where(rb == 0, torch.tensor(HIGH_VOL_SAMPLE_WEIGHT, device=DEVICE), w)
-        # Time-decay weighting
         w = w * time_w
-        # Tactical loss (daily sanity-check) with weights
         mse_d = (((pred_d.squeeze(-1) - yb_d.squeeze(-1)) ** 2) * w).sum() / (w.sum() + 1e-8)
 
-        # Total objective (dual brain):
-        #   0.7 * RankingLoss + 0.3 * DailyMSE
-        # Keep lambda_rank as a global scale knob.
-        # Strategic loss: weight rank loss by average regime weight in the batch
-        strategic = lambda_rank * rank_loss * (w.mean())
-        loss = 0.7 * strategic + 0.3 * mse_d
+        if USE_TOURNAMENT_LOSS:
+            loss = rank_loss + AUX_DAILY_WEIGHT * mse_d
+        else:
+            strategic = lambda_rank * rank_loss * (w.mean())
+            loss = 0.7 * strategic + 0.3 * mse_d
+
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP)
         optimizer.step()
@@ -665,17 +852,33 @@ def _train_one_epoch(
             lr=f"{optimizer.param_groups[0]['lr']:.1e}",
             refresh=False,
         )
+
+        pred_accum.append(_monthly_pred_unscaled(pred_m, y_scaler).detach())
+        actual_accum.append(yb_m_raw.detach())
+
+    if pred_accum:
+        _log_pred_dist(torch.cat(pred_accum), torch.cat(actual_accum), tag="train")
+
     return total / max(n, 1)
 
 
-def _eval_loss(model, loader, criterion):
+def _eval_loss(
+    model,
+    loader,
+    criterion,
+    y_scaler: RobustScaler,
+    lambda_rank: float = 0.2,
+):
     model.eval()
     total = 0.0
     n = 0
+    pred_accum: list[torch.Tensor] = []
+    actual_accum: list[torch.Tensor] = []
     with torch.no_grad():
-        for Xb, yb_m, yb_d, rb, tb, db in loader:
+        for Xb, yb_m, yb_d, rb, tb, db, yb_m_raw in loader:
             Xb = Xb.to(DEVICE)
             yb_m = yb_m.to(DEVICE)
+            yb_m_raw = yb_m_raw.to(DEVICE).squeeze(-1)
             yb_d = yb_d.to(DEVICE)
             rb = rb.squeeze(-1).to(DEVICE)
             tb = tb.squeeze(-1).to(DEVICE)
@@ -683,13 +886,15 @@ def _eval_loss(model, loader, criterion):
             pred_m, pred_d, _ = model(Xb, rb, ticker_id=tb)
 
             time_w = _time_decay_weights(db).to(dtype=torch.float32)
-            rank_losses = []
-            rank_w = []
+            rank_losses: list[torch.Tensor] = []
+            rank_w: list[torch.Tensor] = []
             for d in torch.unique(db):
                 m = db == d
-                if int(m.sum()) >= 4:
+                if int(m.sum()) >= MIN_CROSSSECTION_SIZE:
                     gw = time_w[m].mean().clamp_min(1e-8)
-                    rank_losses.append(_margin_rank_loss(pred_m[m], yb_m[m], margin=RANKING_MARGIN) * gw)
+                    rank_losses.append(
+                        _rank_term(pred_m[m], yb_m[m], yb_m_raw[m], y_scaler) * gw
+                    )
                     rank_w.append(gw)
             if rank_losses:
                 rank_loss = torch.stack(rank_losses).sum() / (torch.stack(rank_w).sum() + 1e-8)
@@ -701,11 +906,24 @@ def _eval_loss(model, loader, criterion):
             w = w * time_w
             mse_d = (((pred_d.squeeze(-1) - yb_d.squeeze(-1)) ** 2) * w).sum() / (w.sum() + 1e-8)
 
-            strategic = 0.2 * rank_loss * (w.mean())
-            total += float((0.7 * strategic + 0.3 * mse_d).item())
+            if USE_TOURNAMENT_LOSS:
+                batch_loss = rank_loss + AUX_DAILY_WEIGHT * mse_d
+            else:
+                strategic = lambda_rank * rank_loss * (w.mean())
+                batch_loss = 0.7 * strategic + 0.3 * mse_d
+
+            total += float(batch_loss.item())
             n += 1
+
+            pred_accum.append(_monthly_pred_unscaled(pred_m, y_scaler))
+            actual_accum.append(yb_m_raw)
+
             if DEVICE.type == "mps":
                 torch.mps.empty_cache()
+
+    if pred_accum:
+        _log_pred_dist(torch.cat(pred_accum), torch.cat(actual_accum), tag="val")
+
     return total / max(n, 1)
 
 
@@ -715,7 +933,7 @@ def _predict(model, loader) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     actuals = []
     ticker_ids = []
     with torch.no_grad():
-        for Xb, yb_m, _yb_d, rb, tb, _db in loader:
+        for Xb, yb_m, _yb_d, rb, tb, _db, _yb_raw in loader:
             Xb = Xb.to(DEVICE)
             rb = rb.squeeze(-1).to(DEVICE)
             tb = tb.squeeze(-1).to(DEVICE)
@@ -803,7 +1021,7 @@ def save_ramt_inference_artifacts(
     out_dir: Path,
     *,
     model: torch.nn.Module,
-    scaler: RobustScaler,
+    scaler: Union[RobustScaler, "SectorNeutralScaler"],
     y_scaler: RobustScaler,
     train_start: str,
     train_end: str,

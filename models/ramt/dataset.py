@@ -3,6 +3,7 @@ import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -36,7 +37,9 @@ ALL_FEATURE_COLS = PRICE_COLS + TECH_COLS + VOLUME_COLS + MACRO_COLS
 # Separate gate input for the transformer (not part of scaled feature vector)
 HMM_REGIME_COL = "HMM_Regime"
 
-TARGET_COL = "Monthly_Alpha"
+# Intra-sector median-demeaned alpha (see features/feature_engineering.apply_sector_alpha_panel).
+# Parquets without this column fall back to Monthly_Alpha in LazyTickerStore.
+TARGET_COL = "Sector_Alpha"
 BENCHMARK_TICKER_STEMS = {"_NSEI", "NSEI", "^NSEI", "NIFTY50", "SP500", "JPM"}
 _UNIVERSE_SNAPSHOT_WARNED = False
 
@@ -91,6 +94,13 @@ def build_ticker_universe(processed_dir: str = "data/processed") -> list[str]:
 # Stable ticker universe for embeddings / cross-stock training.
 TICKER_LIST = build_ticker_universe() or ["TCS_NS"]
 TICKER_TO_ID = {t: i for i, t in enumerate(TICKER_LIST)}
+
+
+def _sector_for_ticker_name(ticker: str) -> str:
+    """Lazy import so dataset stays usable without the features package in minimal tests."""
+    from features.sectors import get_sector
+
+    return get_sector(ticker)
 
 
 def _regime_fallback_from_ret1d(ret1d: pd.Series) -> np.ndarray:
@@ -219,9 +229,14 @@ class RAMTDataset:
             raise ValueError(f"Missing feature columns for {self.ticker}: {missing}")
 
         if TARGET_COL not in df.columns:
-            raise ValueError(f"Missing target {TARGET_COL} for {self.ticker}")
+            if TARGET_COL == "Sector_Alpha" and "Monthly_Alpha" in df.columns:
+                eff = "Monthly_Alpha"
+            else:
+                raise ValueError(f"Missing target {TARGET_COL} for {self.ticker}")
+        else:
+            eff = TARGET_COL
 
-        df = df.dropna(subset=[TARGET_COL])
+        df = df.dropna(subset=[eff])
         # Daily_Return optional for single-ticker loaders; multi-ticker training sets it
         if "Daily_Return" in df.columns:
             df = df.dropna(subset=["Daily_Return"])
@@ -231,7 +246,7 @@ class RAMTDataset:
         self.df = df
         self.dates = df.index.values
         self.features_raw = df[list(ALL_FEATURE_COLS)].values.astype(np.float32)
-        self.targets = df[TARGET_COL].values.astype(np.float32)
+        self.targets = df[eff].values.astype(np.float32)
         self.regimes = regime_arr.astype(np.int64)
 
     def get_fold_loaders(self, train_idx, test_idx, val_fraction=0.15):
@@ -334,7 +349,18 @@ class LazyTickerStore:
         if missing:
             raise ValueError(f"{ticker}: missing feature columns: {missing}")
         if TARGET_COL not in df.columns:
-            raise ValueError(f"{ticker}: missing {TARGET_COL}")
+            if TARGET_COL == "Sector_Alpha" and "Monthly_Alpha" in df.columns:
+                warnings.warn(
+                    f"{ticker}: missing Sector_Alpha; using Monthly_Alpha until you re-run "
+                    "features/feature_engineering.py (sector-neutral panel step).",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                eff_target = "Monthly_Alpha"
+            else:
+                raise ValueError(f"{ticker}: missing {TARGET_COL}")
+        else:
+            eff_target = TARGET_COL
 
         # Legacy / partial Parquet may omit Daily_Return; match features/feature_engineering.add_daily_target
         if "Daily_Return" not in df.columns:
@@ -343,11 +369,11 @@ class LazyTickerStore:
             df = df.copy()
             df["Daily_Return"] = df["Ret_1d"].shift(-1)
 
-        df = df.dropna(subset=[TARGET_COL, "Daily_Return"])
+        df = df.dropna(subset=[eff_target, "Daily_Return"])
 
         dates = pd.DatetimeIndex(df["Date"])
         X = df[list(ALL_FEATURE_COLS)].values.astype(np.float32)
-        y_m = df[TARGET_COL].values.astype(np.float32)
+        y_m = df[eff_target].values.astype(np.float32)
         y_d = df["Daily_Return"].values.astype(np.float32)
         r = ensure_hmm_regime_array(df)
 
@@ -374,7 +400,7 @@ class LazyMultiTickerSequenceDataset(Dataset):
         store: LazyTickerStore,
         sample_keys: list[tuple[str, int]],
         seq_len: int = 30,
-        feature_scaler: RobustScaler | None = None,
+        feature_scaler: RobustScaler | Any = None,
         y_scaler: RobustScaler | None = None,
         y_winsor_lo: float | None = None,
         y_winsor_hi: float | None = None,
@@ -382,7 +408,7 @@ class LazyMultiTickerSequenceDataset(Dataset):
         self.store = store
         self.sample_keys = sample_keys
         self.seq_len = int(seq_len)
-        self.feature_scaler = feature_scaler
+        self.feature_scaler = feature_scaler  # RobustScaler or SectorNeutralScaler (set_active_sector)
         self.y_scaler = y_scaler
         self.y_winsor_lo = y_winsor_lo
         self.y_winsor_hi = y_winsor_hi
@@ -395,24 +421,30 @@ class LazyMultiTickerSequenceDataset(Dataset):
         td = self.store.get(ticker)
         X_raw = td["X"][i - self.seq_len : i]
         if self.feature_scaler is not None:
-            X = self.feature_scaler.transform(X_raw.astype(np.float64, copy=False)).astype(
-                np.float32
-            )
+            fs = self.feature_scaler
+            if hasattr(fs, "set_active_sector"):
+                fs.set_active_sector(_sector_for_ticker_name(ticker))
+            X = fs.transform(X_raw.astype(np.float64, copy=False)).astype(np.float32)
         else:
             X = np.asarray(X_raw, dtype=np.float32)
 
         y_m_raw = float(td["y_m"][i])
         if self.y_winsor_lo is not None and self.y_winsor_hi is not None:
-            y_m_raw = float(np.clip(y_m_raw, self.y_winsor_lo, self.y_winsor_hi))
-        if self.y_scaler is not None:
-            y_m = float(self.y_scaler.transform(np.array([[y_m_raw]], dtype=np.float64))[0, 0])
+            y_m_raw_w = float(np.clip(y_m_raw, self.y_winsor_lo, self.y_winsor_hi))
         else:
-            y_m = y_m_raw
+            y_m_raw_w = y_m_raw
+        if self.y_scaler is not None:
+            y_m = float(
+                self.y_scaler.transform(np.array([[y_m_raw_w]], dtype=np.float64))[0, 0]
+            )
+        else:
+            y_m = y_m_raw_w
 
         y_d = float(td["y_d"][i])
         r = int(td["r"][i])
         d = int(td["dates"][i].value)
         tid = int(TICKER_TO_ID.get(ticker, 0))
+        # Winsorized raw monthly target (for ranking loss in unscaled alpha units)
         return (
             torch.from_numpy(X),
             torch.tensor([y_m], dtype=torch.float32),
@@ -420,6 +452,7 @@ class LazyMultiTickerSequenceDataset(Dataset):
             torch.tensor([r], dtype=torch.long),
             torch.tensor([tid], dtype=torch.long),
             torch.tensor([d], dtype=torch.long),
+            torch.tensor([y_m_raw_w], dtype=torch.float32),
         )
 
 
