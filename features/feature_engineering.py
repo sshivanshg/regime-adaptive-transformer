@@ -13,7 +13,10 @@ This version is refactored for the NIFTY 200 Parquet-based raw store:
 
 from __future__ import annotations
 
+import contextlib
+import io
 from pathlib import Path
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -45,6 +48,7 @@ MACRO_TICKERS: dict[str, str] = {
     "USDINR": "INR=X",
     "SP500": "^GSPC",
 }
+HMM_MIN_OBS = 60
 
 # Required columns in raw parquet files created by scripts/fetch_nifty200.py
 RAW_REQUIRED_COLS = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]
@@ -311,14 +315,67 @@ def _semantic_hmm_mapping(mean_by_state: dict[int, float]) -> dict[int, int]:
     Map raw 3-state HMM states to semantic regime codes:
     bull=1 (highest mean return), bear=2 (lowest mean return), high_vol=0 (middle).
     """
-    states = sorted(mean_by_state.keys(), key=lambda s: mean_by_state[s])
-    low, mid, high = states[0], states[1], states[2]
-    return {high: 1, low: 2, mid: 0}
+    active = {int(k): float(v) for k, v in mean_by_state.items() if np.isfinite(v)}
+    if not active:
+        raise ValueError("Cannot map semantic HMM states without any active states.")
+
+    states = sorted(active.keys(), key=lambda s: active[s])
+    if len(states) == 1:
+        return {states[0]: 0}
+    if len(states) == 2:
+        low, high = states[0], states[1]
+        return {high: 1, low: 2}
+
+    low = states[0]
+    high = states[-1]
+    middle_states = states[1:-1]
+    mid = middle_states[len(middle_states) // 2]
+
+    mapping = {high: 1, low: 2}
+    for s in middle_states:
+        mapping[s] = 0
+    mapping[mid] = 0
+    return mapping
+
+
+def _build_gaussian_hmm(prev_hmm: GaussianHMM | None = None) -> GaussianHMM:
+    """
+    Create a GaussianHMM, warm-starting from the previous expanding-window fit when available.
+    """
+    init_params = "stmc" if prev_hmm is None else ""
+    hmm = GaussianHMM(
+        n_components=3,
+        covariance_type="diag",
+        n_iter=300,
+        tol=1e-4,
+        random_state=42,
+        verbose=False,
+        init_params=init_params,
+        params="stmc",
+    )
+    if prev_hmm is not None:
+        hmm.startprob_ = prev_hmm.startprob_.copy()
+        hmm.transmat_ = prev_hmm.transmat_.copy()
+        hmm.means_ = prev_hmm.means_.copy()
+        hmm._covars_ = prev_hmm._covars_.copy()
+    return hmm
+
+
+def _fit_hmm_silently(hmm: GaussianHMM, X: np.ndarray) -> GaussianHMM:
+    """
+    hmmlearn occasionally writes non-convergence notes directly to stderr/stdout even
+    with ``verbose=False``. Keep feature generation logs readable.
+    """
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        hmm.fit(X)
+    return hmm
 
 
 def add_hmm_regime_full_history(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Fit a 3-state Gaussian HMM on the full available history for the ticker.
+    Fit a 3-state Gaussian HMM on an expanding window so the regime for each date
+    only uses information available up to that date.
+
     Uses [Ret_1d, Realized_Vol_20] to capture high-vol as a distinct state.
     """
     out = df.copy()
@@ -327,36 +384,53 @@ def add_hmm_regime_full_history(df: pd.DataFrame) -> pd.DataFrame:
     mask = lr.notna() & rv20.notna()
     out["HMM_Regime"] = np.nan
 
-    if int(mask.sum()) < 60:
+    if int(mask.sum()) < HMM_MIN_OBS:
         return out
 
-    X_raw = np.column_stack([lr[mask].to_numpy(dtype=float), rv20[mask].to_numpy(dtype=float)])
-    mu = X_raw.mean(axis=0)
-    sigma = X_raw.std(axis=0)
-    sigma = np.where(sigma == 0.0, 1.0, sigma)
-    X = (X_raw - mu) / sigma
-
-    hmm = GaussianHMM(
-        n_components=3,
-        covariance_type="diag",
-        n_iter=300,
-        tol=1e-4,
-        random_state=42,
-        verbose=False,
-    )
-    hmm.fit(X)
-    raw_states = hmm.predict(X)
     idx = out.index[mask]
-
-    means: dict[int, float] = {}
     lr_vals = lr[mask].to_numpy(dtype=float)
-    for k in (0, 1, 2):
-        sel = raw_states == k
-        means[k] = float(np.mean(lr_vals[sel])) if np.any(sel) else float("nan")
+    rv_vals = rv20[mask].to_numpy(dtype=float)
+    X_raw = np.column_stack([lr_vals, rv_vals])
 
-    mapping = _semantic_hmm_mapping(means)
-    sem = np.asarray([mapping[int(s)] for s in raw_states], dtype=np.int64)
-    out.loc[idx, "HMM_Regime"] = sem
+    prev_hmm: GaussianHMM | None = None
+    prev_regime = float("nan")
+    fit_failures = 0
+
+    for end_pos in range(HMM_MIN_OBS - 1, len(idx)):
+        X_hist_raw = X_raw[: end_pos + 1]
+        mu = X_hist_raw.mean(axis=0)
+        sigma = X_hist_raw.std(axis=0)
+        sigma = np.where(sigma == 0.0, 1.0, sigma)
+        X_hist = (X_hist_raw - mu) / sigma
+
+        try:
+            hmm = _build_gaussian_hmm(prev_hmm)
+            hmm = _fit_hmm_silently(hmm, X_hist)
+            raw_states = hmm.predict(X_hist)
+
+            means: dict[int, float] = {}
+            lr_hist = lr_vals[: end_pos + 1]
+            for k in (0, 1, 2):
+                sel = raw_states == k
+                means[k] = float(np.mean(lr_hist[sel])) if np.any(sel) else float("nan")
+
+            mapping = _semantic_hmm_mapping(means)
+            prev_regime = float(mapping[int(raw_states[-1])])
+            prev_hmm = hmm
+        except Exception:
+            fit_failures += 1
+            if not np.isfinite(prev_regime):
+                continue
+
+        out.loc[idx[end_pos], "HMM_Regime"] = prev_regime
+
+    if fit_failures:
+        warnings.warn(
+            f"Causal HMM fit fell back to the prior regime {fit_failures} time(s). "
+            "Inspect data quality if this becomes frequent.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     out["HMM_Regime"] = out["HMM_Regime"].astype("float")
     return out
 

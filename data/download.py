@@ -9,6 +9,7 @@ Saves raw CSVs to data/raw/.
 from __future__ import annotations
 
 from pathlib import Path
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -98,6 +99,14 @@ def load_tickers_from_file(path: Path) -> list[str]:
             f"Missing ticker universe file: {path}\n"
             "Create it with one Yahoo ticker per line (e.g., RELIANCE.NS)."
         )
+    warnings.warn(
+        "Ticker universe file is treated as a static snapshot across all dates. "
+        "If this file contains a 2026 NIFTY 200 list, earlier training periods remain "
+        "survivorship-biased even though the model will not see membership changes as a "
+        "time-varying feature.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
     out: list[str] = []
     for line in path.read_text().splitlines():
         s = line.strip()

@@ -12,6 +12,7 @@ Produces:
 - results/ranking_predictions.csv
 - results/monthly_rankings.csv
 - results/backtest_results.csv
+- results/ramt_model_state.pt + scaler artifacts refreshed after every walk-forward fold
 - results/training_history.csv & results/training_dashboard.png (unless --no-plots)
 
 Use ``--backtest-only`` to skip training and reuse ``ranking_predictions.csv`` after a full run.
@@ -181,6 +182,7 @@ def main() -> None:
             inference_warmup_days=int(args.inference_warmup_days),
             max_epochs=int(args.epochs),
             plot_dir=plot_dir,
+            artifact_dir=str(ROOT / "results"),
         )
 
         preds_out = ROOT / "results/ranking_predictions.csv"

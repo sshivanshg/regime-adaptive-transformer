@@ -32,6 +32,7 @@ from models.ramt.dataset import (
     ALL_FEATURE_COLS,
     LazyMultiTickerSequenceDataset,
     LazyTickerStore,
+    TARGET_COL,
     TICKER_TO_ID,
     build_ticker_universe,
 )
@@ -791,6 +792,70 @@ def _save_training_run_artifacts(
     print(f"Saved training plots: {png_path}  &  {out_dir / 'training_history.csv'}", flush=True)
 
 
+def _artifact_tag(raw: str) -> str:
+    safe = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(raw))
+    while "__" in safe:
+        safe = safe.replace("__", "_")
+    return safe.strip("_") or "fold"
+
+
+def save_ramt_inference_artifacts(
+    out_dir: Path,
+    *,
+    model: torch.nn.Module,
+    scaler: RobustScaler,
+    y_scaler: RobustScaler,
+    train_start: str,
+    train_end: str,
+    lo_b: float,
+    hi_b: float,
+    fold_label: str,
+    fold_tag: str | None = None,
+) -> None:
+    """
+    Persist the inference artifacts expected by the dashboard and audit tools.
+
+    The canonical filenames are overwritten each fold so live inference always uses the
+    freshest expanding-window model. Fold-tagged snapshots are also written for debugging.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "config": {
+            "seq_len": SEQ_LEN,
+            "num_heads": NUM_HEADS,
+            "dropout": MODEL_DROPOUT,
+        },
+        "train_start": str(train_start),
+        "train_end": str(train_end),
+        "fold_label": fold_label,
+        "y_scaler_center": float(np.asarray(y_scaler.center_, dtype=float).ravel()[0]),
+        "y_scaler_scale": float(np.asarray(y_scaler.scale_, dtype=float).ravel()[0]),
+        "y_target_col": TARGET_COL,
+        "y_winsor_lo": float(lo_b),
+        "y_winsor_hi": float(hi_b),
+    }
+
+    state_path = out_dir / "ramt_model_state.pt"
+    scaler_path = out_dir / "ramt_scaler.joblib"
+    y_scaler_path = out_dir / "ramt_y_scaler.joblib"
+    torch.save(payload, state_path)
+    joblib.dump(scaler, scaler_path)
+    joblib.dump(y_scaler, y_scaler_path)
+
+    if fold_tag:
+        tag = _artifact_tag(fold_tag)
+        torch.save(payload, out_dir / f"ramt_model_state_{tag}.pt")
+        joblib.dump(scaler, out_dir / f"ramt_scaler_{tag}.joblib")
+        joblib.dump(y_scaler, out_dir / f"ramt_y_scaler_{tag}.joblib")
+
+    print(
+        f"Saved RAMT fold artifacts for {fold_label}: "
+        f"{state_path.name}, {scaler_path.name}, {y_scaler_path.name}",
+        flush=True,
+    )
+
+
 def combined_walk_forward(
     start: str = "2016-01-01",
     end: str = "2024-12-31",
@@ -801,6 +866,7 @@ def combined_walk_forward(
     inference_warmup_days: int = 30,
     max_epochs: int | None = None,
     plot_dir: str | None = "results",
+    artifact_dir: str | None = None,
 ) -> pd.DataFrame:
     """
     Combined RAMT with **decoupled** walk-forward training vs inference cadence.
@@ -859,6 +925,19 @@ def combined_walk_forward(
             save_artifacts=bool(plot_dir) and seg_idx == 0,
             fold_label=fold_label,
         )
+        if artifact_dir:
+            save_ramt_inference_artifacts(
+                Path(artifact_dir),
+                model=model,
+                scaler=scaler,
+                y_scaler=y_scaler,
+                train_start=TRAIN_START,
+                train_end=train_end_inclusive,
+                lo_b=lo_b,
+                hi_b=hi_b,
+                fold_label=fold_label,
+                fold_tag=f"wf_seg_{seg_idx + 1:02d}",
+            )
 
         # Next segment start (exclusive upper bound for prediction dates in this fold)
         seg_end_ts = (
@@ -1068,24 +1147,18 @@ def train_fixed_and_predict(
         model.load_state_dict(best_state)
 
     # Save artifacts for later inspection (e.g., attention maps)
-    os.makedirs("results", exist_ok=True)
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "config": {"seq_len": SEQ_LEN},
-            "train_start": str(train_start_ts.date()),
-            "train_end": str(train_end_ts.date()),
-            "val_start": str(val_start.date()),
-            "y_scaler_center": float(y_scaler.center_[0]),
-            "y_scaler_scale": float(y_scaler.scale_[0]),
-            "y_target_col": target_col,
-            "y_winsor_lo": float(lo_b),
-            "y_winsor_hi": float(hi_b),
-        },
-        "results/ramt_model_state.pt",
+    save_ramt_inference_artifacts(
+        Path("results"),
+        model=model,
+        scaler=scaler,
+        y_scaler=y_scaler,
+        train_start=str(train_start_ts.date()),
+        train_end=str(train_end_ts.date()),
+        lo_b=lo_b,
+        hi_b=hi_b,
+        fold_label=f"fixed_train_{train_start_ts.date()}_{train_end_ts.date()}",
+        fold_tag="fixed_train_latest",
     )
-    joblib.dump(scaler, "results/ramt_scaler.joblib")
-    joblib.dump(y_scaler, "results/ramt_y_scaler.joblib")
 
     # Predict on rebalance dates in test period
     rebal_test = _rebalance_dates_21d("data/raw/_NSEI.parquet", test_start, test_end, step_size=step_size)

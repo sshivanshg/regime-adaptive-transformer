@@ -1,4 +1,5 @@
 import os
+import warnings
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,8 @@ ALL_FEATURE_COLS = PRICE_COLS + TECH_COLS + VOLUME_COLS + MACRO_COLS
 HMM_REGIME_COL = "HMM_Regime"
 
 TARGET_COL = "Monthly_Alpha"
+BENCHMARK_TICKER_STEMS = {"_NSEI", "NSEI", "^NSEI", "NIFTY50", "SP500", "JPM"}
+_UNIVERSE_SNAPSHOT_WARNED = False
 
 
 def _ticker_from_processed_filename(name: str) -> str:
@@ -45,21 +48,41 @@ def _ticker_from_processed_filename(name: str) -> str:
     return stem
 
 
+def _is_excluded_universe_ticker(stem: str) -> bool:
+    return stem.strip().upper() in BENCHMARK_TICKER_STEMS
+
+
 def build_ticker_universe(processed_dir: str = "data/processed") -> list[str]:
     """
     Build the cross-stock training universe from processed feature files.
 
-    We intentionally exclude benchmark / non-universe symbols.
+    We intentionally keep a static tradable universe snapshot across all dates.
+    That avoids turning later index adds/deletes into a time-varying training signal.
+
+    Important: this does NOT solve survivorship bias. If the local files were built
+    from a 2026 NIFTY 200 list, the research still uses a 2026 snapshot. The model
+    simply does not get to observe membership deletions/additions as a feature over time.
     """
     pdir = Path(processed_dir)
     if not pdir.exists():
         return []
 
-    exclude = {"NIFTY50", "SP500", "JPM", "NSEI"}
+    global _UNIVERSE_SNAPSHOT_WARNED
+    if not _UNIVERSE_SNAPSHOT_WARNED:
+        warnings.warn(
+            "Tradable universe is a static local snapshot (for this repo, typically the "
+            "2026 NIFTY 200 list). Historical index membership is not reconstructed, but "
+            "the universe is held fixed across all training dates so the model does not "
+            "learn add/delete events such as a 2024 removal during 2015 training.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        _UNIVERSE_SNAPSHOT_WARNED = True
+
     tickers: list[str] = []
     for p in sorted(list(pdir.glob("*_features.parquet"))):
         t = _ticker_from_processed_filename(p.name)
-        if t in exclude:
+        if _is_excluded_universe_ticker(t):
             continue
         tickers.append(t)
     return tickers
@@ -76,9 +99,11 @@ def _regime_fallback_from_ret1d(ret1d: pd.Series) -> np.ndarray:
     Maps to {0,1,2} compatible with the model's regime embedding.
     """
     rv = ret1d.astype(float).rolling(20, min_periods=5).std()
-    rv = rv.bfill().ffill()
-    if rv.isna().all():
-        return np.ones(len(ret1d), dtype=np.int64)
+    if rv.isna().any():
+        raise ValueError(
+            "HMM_Regime is missing and causal fallback would require non-causal backfill. "
+            "Regenerate processed features with a valid HMM_Regime column."
+        )
     try:
         # Terciles: low vol ~ bull(1), mid ~ high_vol(0), high vol ~ bear(2) — order by vol ascending
         q = pd.qcut(rv, q=3, labels=[1, 0, 2], duplicates="drop")

@@ -6,7 +6,7 @@ Monthly rebalancing strategy:
 2. Check HMM regime
 3. If BULL: top N RAMT-ranked stocks at 100% allocation
 4. If HIGH_VOL: top 3 at 50% allocation
-5. If BEAR: top 5 at 20% allocation (5% one-period loss floor on portfolio return)
+5. If BEAR: top 5 at 20% allocation
 6. Hold until next month
 7. Repeat
 
@@ -24,6 +24,10 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+
+REAL_2026_REBALANCE_FRICTION_RATE = 0.0022
+LEGACY_REBALANCE_FRICTION_RATE = 0.0020
 
 
 # -----------------------------------------------------------------------------
@@ -205,6 +209,21 @@ def _load_price_series(raw_path: str) -> pd.Series:
     return s
 
 
+def _period_return_from_prices(price_start: float, price_end: float) -> float:
+    if not np.isfinite(price_start) or not np.isfinite(price_end) or abs(price_start) <= 1e-12:
+        return 0.0
+    period_return = (price_end - price_start) / price_start
+    return float(period_return)
+
+
+def _window_period_return(window: pd.Series) -> float:
+    if window.empty:
+        return 0.0
+    price_start = float(window.iloc[0])
+    price_end = float(window.iloc[-1])
+    return _period_return_from_prices(price_start, price_end)
+
+
 def build_rebalance_regime_df(
     nifty_features_path: str,
     rebalance_dates: pd.DatetimeIndex,
@@ -287,6 +306,7 @@ def run_backtest(
     end: str = "2024-12-31",
     top_n: int = 5,
     capital: float = 50000,
+    raw_dir: str | None = None,
     *,
     use_kelly_weights: bool = True,
     kelly_p: float = 0.5238,
@@ -312,6 +332,11 @@ def run_backtest(
 
     predictions_df columns:
       Date, Ticker, predicted_alpha, actual_alpha
+      Optional: price_start, price_end
+
+    If ``price_start``/``price_end`` are present, or ``raw_dir`` is supplied so prices
+    can be loaded from disk, realized period returns use total return rather than
+    ``actual_alpha``.
 
     regime_df columns:
       Date, regime (0/1/2)
@@ -332,6 +357,17 @@ def run_backtest(
     kelly_f_star_global = kelly_optimal_fraction(float(kelly_p), kb)
 
     pv = float(capital)
+    price_cache: dict[str, pd.Series] = {}
+    raw_root = Path(raw_dir) if raw_dir is not None else None
+
+    def get_prices(ticker: str) -> pd.Series:
+        if raw_root is None:
+            raise ValueError("raw_dir is required to compute realized total returns from price history.")
+        if ticker in price_cache:
+            return price_cache[ticker]
+        path = raw_root / f"{ticker}.parquet"
+        price_cache[ticker] = _load_price_series(str(path))
+        return price_cache[ticker]
 
     for i, date in enumerate(monthly_dates[:-1]):
         _next_date = monthly_dates[i + 1]
@@ -341,7 +377,7 @@ def run_backtest(
             continue
         regime = int(month_regime[0])
 
-        if regime == 2:  # Bear — fractional toe-hold + loss floor (trailing-stop proxy)
+        if regime == 2:  # Bear — fractional toe-hold
             position_size = 0.2
             top_n_regime = min(5, top_n)
         elif regime == 0:  # High vol
@@ -357,7 +393,25 @@ def run_backtest(
         if month_preds.empty:
             continue
 
-        actual_returns = month_preds["actual_alpha"].values.astype(float)
+        if {"price_start", "price_end"}.issubset(month_preds.columns):
+            price_start = month_preds["price_start"].values.astype(float)
+            price_end = month_preds["price_end"].values.astype(float)
+            actual_returns = np.asarray(
+                [
+                    _period_return_from_prices(start_px, end_px)
+                    for start_px, end_px in zip(price_start, price_end)
+                ],
+                dtype=float,
+            )
+        elif raw_root is not None:
+            actual_return_list = []
+            for ticker in month_preds["Ticker"]:
+                prices = get_prices(ticker)
+                window = prices.loc[(prices.index >= date) & (prices.index < _next_date)]
+                actual_return_list.append(_window_period_return(window))
+            actual_returns = np.asarray(actual_return_list, dtype=float)
+        else:
+            actual_returns = month_preds["actual_alpha"].values.astype(float)
         pred_alpha = month_preds["predicted_alpha"].values.astype(float)
         ps = float(position_size)
         if kelly_scale_position and kelly_f_star_global > 0.0:
@@ -380,8 +434,6 @@ def run_backtest(
             basket_ret = float(np.mean(actual_returns))
             w_max = float("nan")
         portfolio_return = basket_ret * ps
-        if regime == 2:
-            portfolio_return = float(max(portfolio_return, -0.05))
 
         pv_start = pv
         pv = pv * (1.0 + portfolio_return)
@@ -445,7 +497,7 @@ def run_backtest_daily(
     stop_loss_bear: float = 0.05,
     max_weight: float = 0.20,
     portfolio_dd_cash_trigger: float = 0.15,
-    rebalance_friction_rate: float = 0.002,
+    rebalance_friction_rate: float = REAL_2026_REBALANCE_FRICTION_RATE,
     turnover_penalty_score: float = 0.0,
     *,
     use_kelly_weights: bool = True,
@@ -473,7 +525,7 @@ def run_backtest_daily(
     ``kelly_b`` or the empirical win/loss ratio is used.
 
     - Rebalance every `step_size` trading days on NIFTY calendar.
-    - **Friction:** each rebalance deducts ``rebalance_friction_rate`` (default **0.2%**)
+    - **Friction:** each rebalance deducts ``rebalance_friction_rate`` (default **0.22%**)
       from **total trade value** = equity notional at rebalance, ``pv_start * invested``
       (STT + slippage combined; applied every window we deploy capital).
     - Stop-loss per stock (intraperiod): ``stop_loss`` by default; in BEAR use ``stop_loss_bear`` (5%).
@@ -487,6 +539,9 @@ def run_backtest_daily(
     preds["Date"] = pd.to_datetime(preds["Date"])
     start_ts = pd.to_datetime(start)
     end_ts = pd.to_datetime(end)
+    effective_friction_rate = float(rebalance_friction_rate)
+    if np.isclose(effective_friction_rate, LEGACY_REBALANCE_FRICTION_RATE):
+        effective_friction_rate = REAL_2026_REBALANCE_FRICTION_RATE
 
     kb_global = float(kelly_b) if kelly_b is not None else estimate_win_loss_ratio(preds["actual_alpha"])
     kelly_f_star_global = kelly_optimal_fraction(float(kelly_p), kb_global)
@@ -635,9 +690,9 @@ def run_backtest_daily(
             denom = max(1, len(new_holdings.union(prev_holdings)))
             turnover = invested * (changed / denom)
 
-        # STT + slippage: flat rate on total equity trade value at this rebalance (₹ terms)
-        trade_value = float(pv_start * invested)
-        friction_cost = trade_value * float(rebalance_friction_rate)
+        # 2026 fee schedule: 0.1% buy + 0.1% sell + GST/levies on total trade value.
+        total_trade_value = float(pv_start * invested)
+        friction_fee = total_trade_value * effective_friction_rate
 
         stock_rets = []
         stopped = []
@@ -648,14 +703,11 @@ def run_backtest_daily(
                 stock_rets.append(0.0)
                 continue
             entry = float(window.iloc[0])
-            # stop-loss check
+            # Audit-only stop breach flag; realized return still reflects the full window.
             min_px = float(window.min())
             if (min_px / entry - 1.0) <= -sl_stock:
-                stock_rets.append(-sl_stock)
                 stopped.append(t)
-            else:
-                exit_px = float(window.iloc[-1])
-                stock_rets.append(exit_px / entry - 1.0)
+            stock_rets.append(_window_period_return(window))
 
         stock_rets_arr = np.asarray(stock_rets, dtype=float)
         if use_kelly_weights:
@@ -663,9 +715,7 @@ def run_backtest_daily(
         else:
             gross_stock_ret = float(np.mean(stock_rets_arr)) if len(stock_rets_arr) else 0.0
             port_ret_gross = invested * gross_stock_ret  # cash returns 0
-        port_ret = port_ret_gross - (friction_cost / pv_start if pv_start > 0 else 0.0)
-        if regime == 2:
-            port_ret = float(max(port_ret, -0.05))
+        port_ret = port_ret_gross - (friction_fee / pv_start if pv_start > 0 else 0.0)
 
         if port_ret <= -portfolio_dd_cash_trigger:
             forced_cash_next = True
@@ -676,9 +726,9 @@ def run_backtest_daily(
                 "date": d0,
                 "portfolio_return": port_ret,
                 "portfolio_return_gross": port_ret_gross,
-                "trade_value": trade_value,
-                "friction_cost": float(friction_cost),
-                "rebalance_friction_rate": float(rebalance_friction_rate),
+                "trade_value": total_trade_value,
+                "friction_cost": float(friction_fee),
+                "rebalance_friction_rate": float(effective_friction_rate),
                 "turnover": float(turnover),
                 "regime": ["HIGH_VOL", "BULL", "BEAR"][regime],
                 "stocks_held": tickers,

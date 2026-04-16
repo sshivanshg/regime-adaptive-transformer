@@ -1125,8 +1125,81 @@ def fetch_live_macro_data_cached(ticker_stem: str, root_s: str) -> dict[str, Any
     return fetch_live_macro_data_engine(ticker_stem, Path(root_s))
 
 
-def compute_live_stock_feature_row(stem: str, root: Path) -> pd.Series | None:
-    """Last-known price/tech/volume row from processed Parquet (no network I/O)."""
+def _load_stock_raw_history(stem: str, root: Path) -> pd.DataFrame | None:
+    pq = root / "data" / "raw" / f"{stem}.parquet"
+    csv = root / "data" / "raw" / f"{stem}_raw.csv"
+    path = pq if pq.is_file() else csv
+    if not path.is_file():
+        return None
+    if path.suffix == ".parquet":
+        df = pd.read_parquet(path)
+    else:
+        df = pd.read_csv(path, parse_dates=["Date"])
+    if df.empty or "Date" not in df.columns:
+        return None
+    if "Adj Close" not in df.columns and "Close" in df.columns:
+        df["Adj Close"] = df["Close"].astype(float)
+    if "Adj Close" not in df.columns or "Volume" not in df.columns:
+        return None
+    df["Date"] = pd.to_datetime(df["Date"])
+    return df.sort_values("Date").reset_index(drop=True)
+
+
+def compute_live_stock_feature_history(stem: str, root: Path) -> pd.DataFrame | None:
+    """
+    Recompute stock-only price/technical/volume features from the freshest raw bars.
+
+    Processed feature files stop before the latest dates because the supervised targets drop
+    the unlabeled tail, so the live predictor needs a raw-price bridge.
+    """
+    raw = _load_stock_raw_history(stem, root)
+    if raw is None or raw.empty:
+        return None
+
+    px = raw["Adj Close"].astype(float).replace(0.0, np.nan)
+    vol = raw["Volume"].astype(float)
+    out = raw[["Date"]].copy()
+
+    r1 = px / px.shift(1)
+    r5 = px / px.shift(5)
+    r21 = px / px.shift(21)
+    out["Ret_1d"] = np.log(r1.where(r1 > 0.0))
+    out["Ret_5d"] = np.log(r5.where(r5 > 0.0))
+    out["Ret_21d"] = np.log(r21.where(r21 > 0.0))
+
+    delta = px.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    alpha = 1.0 / 14.0
+    avg_gain = gain.ewm(alpha=alpha, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=alpha, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    out["RSI_14"] = (100.0 - (100.0 / (1.0 + rs))).where(avg_loss != 0.0, 100.0)
+
+    ma20 = px.rolling(20).mean()
+    std20 = px.rolling(20).std()
+    denom = (2.0 * std20).replace(0.0, np.nan)
+    out["BB_Dist"] = (px - ma20) / denom
+
+    sma20 = vol.rolling(20).mean().replace(0.0, np.nan)
+    out["Volume_Surge"] = vol / sma20
+    return out
+
+
+def compute_live_stock_feature_snapshot(stem: str, root: Path) -> dict[str, Any] | None:
+    need = list(PRICE_COLS + TECH_COLS + VOLUME_COLS)
+
+    raw_hist = compute_live_stock_feature_history(stem, root)
+    if raw_hist is not None and not raw_hist.empty:
+        ready = raw_hist.dropna(subset=need, how="any")
+        if not ready.empty:
+            last = ready.iloc[-1]
+            return {
+                "features": last[need],
+                "as_of": pd.Timestamp(last["Date"]),
+                "source": "raw",
+            }
+
     pq = root / "data" / "processed" / f"{stem}_features.parquet"
     if not pq.is_file():
         return None
@@ -1136,10 +1209,36 @@ def compute_live_stock_feature_row(stem: str, root: Path) -> pd.Series | None:
     df["Date"] = pd.to_datetime(df["Date"])
     df = df.sort_values("Date")
     last = df.iloc[-1]
-    need = list(PRICE_COLS + TECH_COLS + VOLUME_COLS)
     if not all(c in last.index for c in need):
         return None
-    return last[need]
+    return {
+        "features": last[need],
+        "as_of": pd.Timestamp(last["Date"]),
+        "source": "processed",
+    }
+
+
+def compute_live_stock_feature_row(stem: str, root: Path) -> pd.Series | None:
+    snap = compute_live_stock_feature_snapshot(stem, root)
+    if snap is None:
+        return None
+    return snap["features"]
+
+
+def latest_stock_regime(stem: str, root: Path) -> int | None:
+    pq = root / "data" / "processed" / f"{stem}_features.parquet"
+    if not pq.is_file():
+        return None
+    df = pd.read_parquet(pq, columns=["HMM_Regime"])
+    if df.empty:
+        return None
+    return int(np.clip(int(round(float(df["HMM_Regime"].iloc[-1]))), 0, 2))
+
+
+def _log_return_to_pct(value: float) -> float:
+    if not np.isfinite(value):
+        return 0.0
+    return float((np.exp(float(value)) - 1.0) * 100.0)
 
 
 def build_live_ramt_sequence(
@@ -1163,18 +1262,30 @@ def build_live_ramt_sequence(
     if miss:
         return None
 
-    base = raw[ALL_FEATURE_COLS].values.astype(np.float32)
+    seq_df = raw[["Date"] + ALL_FEATURE_COLS].copy()
+    stock_hist = compute_live_stock_feature_history(ticker_stem, root)
+    if stock_hist is not None and not stock_hist.empty:
+        seq_df = seq_df.set_index("Date")
+        stock_hist = stock_hist.set_index("Date")
+        union_idx = seq_df.index.union(stock_hist.index).sort_values()
+        seq_df = seq_df.reindex(union_idx)
+        for c in PRICE_COLS + TECH_COLS + VOLUME_COLS:
+            seq_df.loc[stock_hist.index, c] = stock_hist[c]
+        seq_df.loc[:, MACRO_COLS] = seq_df.loc[:, MACRO_COLS].ffill()
+        seq_df = seq_df.reset_index().rename(columns={"index": "Date"})
+    if len(seq_df) < 30:
+        return None
+
+    base = seq_df[ALL_FEATURE_COLS].tail(30).to_numpy(dtype=np.float32)
     feats = macro_pack.get("macro_features") or {}
     srow = compute_live_stock_feature_row(ticker_stem, root)
 
     idx = {c: i for i, c in enumerate(ALL_FEATURE_COLS)}
-    live = np.zeros(len(ALL_FEATURE_COLS), dtype=np.float32)
+    live = base[-1].copy()
 
     if srow is not None:
         for c in PRICE_COLS + TECH_COLS + VOLUME_COLS:
             live[idx[c]] = float(srow[c])
-        else:
-        live = base[-1].copy()
 
     for c in MACRO_COLS:
         v = feats.get(c, float("nan"))
@@ -1227,7 +1338,7 @@ def impute_missing_with_training_medians(seq_unscaled: np.ndarray, scaler: Any) 
         fill = np.zeros(n_cols, dtype=np.float64)
     elif fill.size < n_cols:
         fill = np.resize(fill, n_cols)
-        else:
+    else:
         fill = fill[:n_cols]
     for j in range(n_cols):
         col = out[:, j]
@@ -1316,35 +1427,54 @@ def run_ramt_live_predict(
 
 
 def render_live_predictor_section(state: SidebarState) -> None:
-        st.markdown("---")
+    stock_snapshot = compute_live_stock_feature_snapshot(state.ticker_code, ROOT)
+    if st.session_state.get("lp_seed_ticker") != state.ticker_code:
+        if stock_snapshot is not None:
+            feats = stock_snapshot["features"]
+            st.session_state["lp_ret_1d_pct"] = _log_return_to_pct(float(feats["Ret_1d"]))
+            st.session_state["lp_mom_20_pct"] = _log_return_to_pct(float(feats["Ret_21d"]))
+            st.session_state["lp_rsi"] = float(feats["RSI_14"])
+            st.session_state["lp_bb"] = float(feats["BB_Dist"])
+            st.session_state["lp_vol"] = float(feats["Volume_Surge"])
+            st.session_state["lp_stock_feature_date"] = str(stock_snapshot["as_of"].date())
+            st.session_state["lp_stock_feature_source"] = str(stock_snapshot["source"])
+        latest_regime = latest_stock_regime(state.ticker_code, ROOT)
+        if latest_regime is not None:
+            st.session_state["lp_regime"] = latest_regime
+        st.session_state.pop("lp_macro_pack", None)
+        st.session_state.pop("lp_fetch_utc", None)
+        st.session_state["lp_seed_ticker"] = state.ticker_code
+
+    st.markdown("---")
     st.markdown("### Live predictor")
     st.caption(
-        "Raw **MarketScraper** (requests + BeautifulSoup) · **10 features** scaled with "
-        "`results/ramt_scaler.joblib`; **HMM regime** is passed separately (not in X). "
-        "Missing feature values use **training medians** from the scaler before `transform`."
+        "Stock price/technical slots come from the ticker’s latest raw bar history; macro "
+        "slots come from **MarketScraper** with Parquet fallbacks. The **HMM regime** is "
+        "passed separately (not in X), and missing values use training medians from "
+        "`results/ramt_scaler.joblib` before `transform`."
     )
 
     b1, b2 = st.columns([1, 2])
     with b1:
-        if st.button("⚡ Sync Live Market Pulse", key="btn_autofill_market"):
-            with st.spinner("Syncing live market pulse…"):
+        if st.button("Sync live inputs", key="btn_autofill_market"):
+            with st.spinner("Syncing live macro pulse and stock technicals…"):
                 pack = fetch_live_macro_data_cached(state.ticker_code, str(ROOT))
             st.session_state["lp_macro_pack"] = pack
             st.session_state["lp_fetch_utc"] = datetime.now(timezone.utc).isoformat()
+            stock_snapshot = compute_live_stock_feature_snapshot(state.ticker_code, ROOT)
+            if stock_snapshot is not None:
+                feats = stock_snapshot["features"]
+                st.session_state["lp_ret_1d_pct"] = _log_return_to_pct(float(feats["Ret_1d"]))
+                st.session_state["lp_mom_20_pct"] = _log_return_to_pct(float(feats["Ret_21d"]))
+                st.session_state["lp_rsi"] = float(feats["RSI_14"])
+                st.session_state["lp_bb"] = float(feats["BB_Dist"])
+                st.session_state["lp_vol"] = float(feats["Volume_Surge"])
+                st.session_state["lp_stock_feature_date"] = str(stock_snapshot["as_of"].date())
+                st.session_state["lp_stock_feature_source"] = str(stock_snapshot["source"])
+            latest_regime = latest_stock_regime(state.ticker_code, ROOT)
+            if latest_regime is not None:
+                st.session_state["lp_regime"] = latest_regime
             if pack.get("ok"):
-                st.session_state["lp_ret_1d_pct"] = float(pack.get("nifty_ret_1d_pct", 0.0))
-                st.session_state["lp_mom_20_pct"] = float(pack.get("nifty_mom_20_pct", 0.0))
-                srow = compute_live_stock_feature_row(state.ticker_code, ROOT)
-                if srow is not None:
-                    st.session_state["lp_rsi"] = float(srow["RSI_14"])
-                    st.session_state["lp_bb"] = float(srow["BB_Dist"])
-                    st.session_state["lp_vol"] = float(srow["Volume_Surge"])
-                pq = ROOT / "data" / "processed" / f"{state.ticker_code}_features.parquet"
-                if pq.is_file():
-                    rdf = pd.read_parquet(pq, columns=["HMM_Regime"])
-                    st.session_state["lp_regime"] = int(
-                        np.clip(int(round(float(rdf["HMM_Regime"].iloc[-1]))), 0, 2)
-                    )
                 st.session_state["lp_vix"] = float(pack.get("vix_level", float("nan")))
                 st.session_state["lp_crude"] = float(pack.get("crude_level", float("nan")))
                 st.session_state["lp_inr"] = float(pack.get("inr_level", float("nan")))
@@ -1356,6 +1486,14 @@ def render_live_predictor_section(state: SidebarState) -> None:
             st.caption(f"Last updated (UTC): **{fu}** · cache TTL 1h")
         else:
             st.caption("Last updated: — (click auto-fill)")
+
+    stock_feature_date = st.session_state.get("lp_stock_feature_date")
+    stock_feature_source = st.session_state.get("lp_stock_feature_source", "processed")
+    if stock_feature_date:
+        st.caption(
+            f"Stock technicals for `{state.ticker_code}` sourced from **{stock_feature_source}** "
+            f"history as of **{stock_feature_date}**."
+        )
 
     pack = st.session_state.get("lp_macro_pack")
     if pack and pack.get("ok") and pack.get("stale"):
@@ -1380,16 +1518,16 @@ def render_live_predictor_section(state: SidebarState) -> None:
         c1, c2 = st.columns(2)
         with c1:
             ret_pct = st.number_input(
-                "Today's return — NIFTY 50 (%)",
+                "Latest stock return (%)",
                 value=float(st.session_state.get("lp_ret_1d_pct", 0.0)),
                 format="%.4f",
-                help="Index 1-day return; drives Ret_1d after log transform.",
+                help="Mapped to the stock’s `Ret_1d` slot after log transform.",
             )
             mom_pct = st.number_input(
-                "20-day momentum — NIFTY 50 (%)",
+                "Latest stock 20-day momentum (%)",
                 value=float(st.session_state.get("lp_mom_20_pct", 0.0)),
                 format="%.4f",
-                help="Mapped to Ret_21d slot (≈21d horizon in features).",
+                help="Mapped to the stock’s `Ret_21d` slot (≈21 trading days).",
             )
             rsi = st.number_input(
                 "RSI (14) — stock",
@@ -1484,7 +1622,7 @@ def render_live_performance_tab(
     shadow_regime: int | None,
 ) -> None:
     st.markdown("### Live performance")
-            st.caption(
+    st.caption(
         "Window metrics recompute from the selected dates; deltas compare to the full "
         "available backtest (same test-only filter)."
     )
@@ -1508,7 +1646,7 @@ def render_live_performance_tab(
         "Max drawdown",
         f"{metrics_win['MaxDD']*100:.2f}%",
         delta=f"{md_d*100:+.2f} pp vs full",
-                )
+    )
 
     st.markdown("---")
     if shadow_regime == 2:
@@ -1516,7 +1654,7 @@ def render_live_performance_tab(
             '<div class="shadow-badge-bear">Status: PROTECTIVE CASH (0%)</div>',
             unsafe_allow_html=True,
         )
-    st.caption(
+        st.caption(
             "HMM **BEAR** vetoes live deployment to cash — shadow table still shows model "
             "rankings so the Transformer signal remains visible."
         )
@@ -1631,31 +1769,31 @@ def render_training_analytics_tab(
     st.markdown("---")
     st.markdown("### Model comparison")
     fig_comp = plot_metrics_comparison(all_predictions, state.ticker_code)
-        if fig_comp:
+    if fig_comp is not None:
         st.plotly_chart(fig_comp, width="stretch")
         if all_predictions:
             rows = []
             for model_name, pred_df in all_predictions.items():
-            t_df = pred_df[pred_df["Ticker"] == state.ticker_code]
+                t_df = pred_df[pred_df["Ticker"] == state.ticker_code]
                 if t_df.empty:
                     continue
-            m = compute_metrics(t_df["y_true"].values, t_df["y_pred"].values)
-            m["Model"] = model_name
+                m = compute_metrics(t_df["y_true"].values, t_df["y_pred"].values)
+                m["Model"] = model_name
                 rows.append(m)
             if rows:
-            mt = pd.DataFrame(rows).set_index("Model")
+                mt = pd.DataFrame(rows).set_index("Model")
                 st.dataframe(
-                mt.style.format(
-                    {
-                        "RMSE": "{:.4f}",
-                        "MAE": "{:.4f}",
-                        "DA%": "{:.2f}%",
-                        "Sharpe": "{:.2f}",
-                        "MaxDD": "{:.4f}",
-                    }
-                ),
-                width="stretch",
-            )
+                    mt.style.format(
+                        {
+                            "RMSE": "{:.4f}",
+                            "MAE": "{:.4f}",
+                            "DA%": "{:.2f}%",
+                            "Sharpe": "{:.2f}",
+                            "MaxDD": "{:.4f}",
+                        }
+                    ),
+                    width="stretch",
+                )
 
     st.markdown("---")
     st.markdown("### Ticker charts")

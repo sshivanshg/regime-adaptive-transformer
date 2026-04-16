@@ -15,6 +15,7 @@ Requirements implemented:
 from __future__ import annotations
 
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -128,6 +129,13 @@ def fetch_nifty200_symbols() -> list[str]:
     """
     Fetch official NIFTY 200 list from NSE and return Yahoo tickers like RELIANCE.NS.
     """
+    warnings.warn(
+        "Fetching the current NIFTY 200 constituent snapshot (April 2026 context). "
+        "This is survivorship-biased for pre-2026 backtests because historical index "
+        "membership is not reconstructed here.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
     table = pd.read_csv(NSE_NIFTY200_CSV_URL)
     if "Symbol" not in table.columns:
         raise RuntimeError(f"NSE CSV missing Symbol column. Columns: {list(table.columns)}")
@@ -237,4 +245,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
