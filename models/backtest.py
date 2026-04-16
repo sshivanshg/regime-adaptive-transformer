@@ -26,6 +26,102 @@ import numpy as np
 import pandas as pd
 
 
+# -----------------------------------------------------------------------------
+# Kelly criterion & signal-weighted baskets
+# -----------------------------------------------------------------------------
+
+
+def kelly_optimal_fraction(p: float, b: float) -> float:
+    """
+    Full Kelly fraction for binary outcomes: f* = (p*b - q) / b, q = 1 - p.
+
+    ``p``: win probability (e.g. directional accuracy).
+    ``b``: win/loss ratio (avg win / |avg loss| on losing trades).
+    """
+    q = 1.0 - float(p)
+    b = float(b)
+    if b <= 1e-12:
+        return 0.0
+    return float((p * b - q) / b)
+
+
+def estimate_win_loss_ratio(actual_alpha: pd.Series | np.ndarray) -> float:
+    """Empirical b = mean(win) / |mean(loss)| from realized alphas."""
+    s = pd.Series(np.asarray(actual_alpha, dtype=float)).replace([np.inf, -np.inf], np.nan).dropna()
+    if s.empty:
+        return 1.0
+    wins = s[s > 0]
+    losses = s[s < 0]
+    if len(wins) < 1 or len(losses) < 1:
+        return 1.0
+    aw = float(wins.mean())
+    al = float(abs(losses.mean()))
+    return float(aw / max(al, 1e-12))
+
+
+def kelly_b_from_predicted_alpha_margin(
+    pred_alpha: np.ndarray,
+    *,
+    scale: float = 0.02,
+) -> float:
+    """
+    Map predicted-alpha spread (top vs bottom of the selected basket) to Kelly odds ``b``.
+
+    ``scale`` is a reference alpha margin (e.g. 0.02 = 2 percentage points) so that
+    wider predicted separation implies larger ``b`` and a higher Kelly fraction.
+    """
+    x = np.asarray(pred_alpha, dtype=float)
+    if x.size == 0:
+        return 1.0
+    margin = float(np.max(x) - np.min(x))
+    return max(1.0, 1.0 + margin / max(float(scale), 1e-12))
+
+
+def basket_weights_from_alpha(
+    predicted_alpha: np.ndarray,
+    *,
+    temperature: float = 1.0,
+    blend_equal: float = 0.0,
+) -> np.ndarray:
+    """
+    Softmax weights over ``predicted_alpha`` so higher-alpha names get more capital.
+    ``blend_equal`` in [0, 1] mixes toward equal weight for stability.
+    """
+    x = np.asarray(predicted_alpha, dtype=float)
+    if x.size == 0:
+        return np.array([])
+    x = x - np.max(x)
+    e = np.exp(x / max(float(temperature), 1e-6))
+    w = e / np.sum(e)
+    if blend_equal > 0.0:
+        n = len(w)
+        eq = np.full(n, 1.0 / n)
+        w = (1.0 - blend_equal) * w + blend_equal * eq
+        w = w / np.sum(w)
+    return w
+
+
+def _nav_fractions_kelly(
+    predicted_alpha: np.ndarray,
+    position_size: float,
+    max_weight: float,
+    *,
+    temperature: float,
+    blend_equal: float,
+) -> tuple[np.ndarray, float]:
+    """
+    NAV fractions per name (sum = invested sleeve before per-name cap), then apply ``max_weight``.
+    Returns (alloc_fractions, invested_after_cap).
+    """
+    w = basket_weights_from_alpha(
+        predicted_alpha, temperature=temperature, blend_equal=blend_equal
+    )
+    alloc = position_size * w
+    alloc = np.minimum(alloc, max_weight)
+    invested = float(np.sum(alloc))
+    return alloc, invested
+
+
 def _load_nifty_benchmark_raw(raw_dir: str | Path) -> pd.DataFrame:
     """
     Load NIFTY benchmark OHLCV from Parquet (preferred) or legacy `_NSEI_raw.csv`.
@@ -191,9 +287,28 @@ def run_backtest(
     end: str = "2024-12-31",
     top_n: int = 5,
     capital: float = 50000,
+    *,
+    use_kelly_weights: bool = True,
+    kelly_p: float = 0.5238,
+    kelly_b: float | None = None,
+    kelly_temperature: float = 1.0,
+    kelly_blend_equal: float = 0.0,
+    kelly_fractional: float = 0.25,
+    kelly_scale_position: bool = False,
 ) -> pd.DataFrame:
     """
     Full portfolio backtest.
+
+    **Geometric growth:** Each month’s ``portfolio_return`` is applied to end-of-month NAV
+    (``portfolio_value``), so profits reinvest before the next rebalance — not a fixed
+    notional each period.
+
+    **Kelly-style sizing (optional):** When ``use_kelly_weights`` is True, intra-month
+    weights follow a softmax over ``predicted_alpha`` (concentrate on top signals). The
+    classical Kelly fraction ``f* = (p*b - q)/b`` is computed from ``kelly_p`` and
+    ``kelly_b`` (or empirical ``b`` from ``actual_alpha`` when ``kelly_b`` is None).
+    Use ``kelly_scale_position`` to optionally scale the regime ``position_size`` by a
+    fractional-Kelly factor (conservative).
 
     predictions_df columns:
       Date, Ticker, predicted_alpha, actual_alpha
@@ -202,9 +317,8 @@ def run_backtest(
       Date, regime (0/1/2)
 
     Returns:
-      Monthly portfolio returns
-      NIFTY benchmark returns
-      All trade history
+      One row per traded month with ``portfolio_return``, ``portfolio_value`` (compounded NAV),
+      and ``cumulative_return`` vs initial ``capital``.
     """
     results: list[dict[str, object]] = []
     monthly_dates = pd.date_range(start, end, freq="MS")
@@ -213,6 +327,11 @@ def run_backtest(
     predictions_df["Date"] = pd.to_datetime(predictions_df["Date"])
     regime_df = regime_df.copy()
     regime_df["Date"] = pd.to_datetime(regime_df["Date"])
+
+    kb = float(kelly_b) if kelly_b is not None else estimate_win_loss_ratio(predictions_df["actual_alpha"])
+    kelly_f_star_global = kelly_optimal_fraction(float(kelly_p), kb)
+
+    pv = float(capital)
 
     for i, date in enumerate(monthly_dates[:-1]):
         _next_date = monthly_dates[i + 1]
@@ -239,17 +358,46 @@ def run_backtest(
             continue
 
         actual_returns = month_preds["actual_alpha"].values.astype(float)
-        portfolio_return = float(np.mean(actual_returns) * position_size)
+        pred_alpha = month_preds["predicted_alpha"].values.astype(float)
+        ps = float(position_size)
+        if kelly_scale_position and kelly_f_star_global > 0.0:
+            ps = float(
+                ps
+                * min(
+                    1.0,
+                    max(0.2, kelly_fractional * kelly_f_star_global / 0.05),
+                )
+            )
+        if use_kelly_weights:
+            w = basket_weights_from_alpha(
+                pred_alpha,
+                temperature=kelly_temperature,
+                blend_equal=kelly_blend_equal,
+            )
+            basket_ret = float(np.dot(w, actual_returns))
+            w_max = float(np.max(w))
+        else:
+            basket_ret = float(np.mean(actual_returns))
+            w_max = float("nan")
+        portfolio_return = basket_ret * ps
         if regime == 2:
             portfolio_return = float(max(portfolio_return, -0.05))
+
+        pv_start = pv
+        pv = pv * (1.0 + portfolio_return)
 
         results.append(
             {
                 "date": date,
                 "portfolio_return": portfolio_return,
+                "portfolio_value_start": pv_start,
+                "portfolio_value": pv,
                 "regime": ["HIGH_VOL", "BULL", "BEAR"][regime],
                 "stocks_held": month_preds["Ticker"].tolist(),
                 "cash": False,
+                "kelly_f_star": kelly_f_star_global,
+                "kelly_b_used": kb,
+                "kelly_largest_weight": w_max,
             }
         )
 
@@ -257,10 +405,13 @@ def run_backtest(
     if results_df.empty:
         return results_df
 
-    results_df["cumulative_return"] = (1 + results_df["portfolio_return"]).cumprod() - 1
+    results_df["cumulative_return"] = results_df["portfolio_value"] / float(capital) - 1.0
 
     monthly_returns = results_df["portfolio_return"].values.astype(float)
-    annual_return = ((1 + np.mean(monthly_returns)) ** 12 - 1) * 100
+    n_m = len(monthly_returns)
+    total_ret = float(results_df["portfolio_value"].iloc[-1] / float(capital) - 1.0)
+    years = n_m / 12.0
+    cagr_pct = ((1.0 + total_ret) ** (1.0 / years) - 1.0) * 100.0 if years > 1e-9 else 0.0
     sharpe = (np.mean(monthly_returns) / (np.std(monthly_returns) + 1e-8)) * np.sqrt(12)
     max_dd = compute_max_drawdown(monthly_returns)
     win_rate = float(np.mean(monthly_returns > 0) * 100)
@@ -268,13 +419,14 @@ def run_backtest(
     print(f"\n{'='*50}")
     print("BACKTEST RESULTS 2016-2024")
     print(f"{'='*50}")
-    print(f"Annual Return:  {annual_return:.1f}%")
+    print(f"CAGR:           {cagr_pct:.1f}%  (reinvested NAV each month)")
     print(f"Sharpe Ratio:   {sharpe:.2f}")
     print(f"Max Drawdown:   {max_dd*100:.1f}%")
     print(f"Win Rate:       {win_rate:.1f}% months")
     print(
         f"Capital: ₹{capital:,} → "
-        f"₹{capital*(1+results_df['cumulative_return'].iloc[-1]):,.0f}"
+        f"₹{float(results_df['portfolio_value'].iloc[-1]):,.0f} "
+        f"(+{total_ret*100:.1f}% total)"
     )
 
     return results_df
@@ -293,14 +445,37 @@ def run_backtest_daily(
     stop_loss_bear: float = 0.05,
     max_weight: float = 0.20,
     portfolio_dd_cash_trigger: float = 0.15,
-    trade_cost_bps: float = 15.0,
-    slippage_bps: float = 10.0,
+    rebalance_friction_rate: float = 0.002,
     turnover_penalty_score: float = 0.0,
+    *,
+    use_kelly_weights: bool = True,
+    kelly_p: float = 0.5238,
+    kelly_b: float | None = None,
+    kelly_use_predicted_margin: bool = False,
+    kelly_alpha_margin_scale: float = 0.02,
+    kelly_temperature: float = 1.0,
+    kelly_blend_equal: float = 0.0,
+    kelly_fractional: float = 0.25,
+    kelly_scale_position: bool = False,
 ) -> pd.DataFrame:
     """
     Daily-price backtest with risk rules.
 
+    **Geometric growth:** Each window starts from the prior window’s ending NAV:
+    ``portfolio_value_start`` equals the previous row’s ``portfolio_value`` (rolling
+    ``pv``), then ``pv_{t+1} = pv_t * (1 + port_ret)``. Friction applies to turnover at
+    that rebalance so compounding reflects post-cost equity.
+
+    **Kelly-style baskets:** When ``use_kelly_weights`` is True, capital is split across
+    names using a softmax over ``predicted_alpha`` (see ``run_backtest``). Otherwise
+    the legacy equal-weight sleeve applies. When ``kelly_use_predicted_margin`` is True,
+    Kelly odds ``b`` come from the predicted-alpha margin each rebalance; otherwise
+    ``kelly_b`` or the empirical win/loss ratio is used.
+
     - Rebalance every `step_size` trading days on NIFTY calendar.
+    - **Friction:** each rebalance deducts ``rebalance_friction_rate`` (default **0.2%**)
+      from **total trade value** = equity notional at rebalance, ``pv_start * invested``
+      (STT + slippage combined; applied every window we deploy capital).
     - Stop-loss per stock (intraperiod): ``stop_loss`` by default; in BEAR use ``stop_loss_bear`` (5%).
     - Max weight per stock: cap at `max_weight`, remainder stays cash.
     - If portfolio return <= -portfolio_dd_cash_trigger in a window:
@@ -312,6 +487,9 @@ def run_backtest_daily(
     preds["Date"] = pd.to_datetime(preds["Date"])
     start_ts = pd.to_datetime(start)
     end_ts = pd.to_datetime(end)
+
+    kb_global = float(kelly_b) if kelly_b is not None else estimate_win_loss_ratio(preds["actual_alpha"])
+    kelly_f_star_global = kelly_optimal_fraction(float(kelly_p), kb_global)
 
     nifty_features_path = resolve_nifty_features_path(nifty_features_path, raw_dir)
 
@@ -345,6 +523,7 @@ def run_backtest_daily(
         d1 = pd.Timestamp(rebal[i + 1])
 
         regime = int(regime_df.loc[:d0].iloc[-1]) if not regime_df.loc[:d0].empty else 1
+        pv_start = float(pv)
         if forced_cash_next:
             results.append(
                 {
@@ -353,6 +532,7 @@ def run_backtest_daily(
                     "regime": "RISK_OFF",
                     "stocks_held": [],
                     "cash": True,
+                    "portfolio_value_start": pv_start,
                     "portfolio_value": pv,
                 }
             )
@@ -382,6 +562,7 @@ def run_backtest_daily(
                     "regime": ["HIGH_VOL", "BULL", "BEAR"][regime],
                     "stocks_held": [],
                     "cash": True,
+                    "portfolio_value_start": pv_start,
                     "portfolio_value": pv,
                 }
             )
@@ -405,33 +586,58 @@ def run_backtest_daily(
                     "regime": ["HIGH_VOL", "BULL", "BEAR"][regime],
                     "stocks_held": [],
                     "cash": True,
+                    "portfolio_value_start": pv_start,
                     "portfolio_value": pv,
                 }
             )
             continue
 
         tickers = month_preds["Ticker"].tolist()
-        base_w = 1.0 / len(tickers)
-        w = min(base_w, max_weight)
-        invested = w * len(tickers)
-        invested *= position_size
+        pred_a = month_preds["predicted_alpha"].values.astype(float)
+        ps = float(position_size)
+        if kelly_use_predicted_margin:
+            kb_here = kelly_b_from_predicted_alpha_margin(
+                pred_a, scale=float(kelly_alpha_margin_scale)
+            )
+            f_star = kelly_optimal_fraction(float(kelly_p), kb_here)
+        else:
+            kb_here = kb_global
+            f_star = kelly_f_star_global
+        if kelly_scale_position and f_star > 0.0:
+            ps = float(
+                ps
+                * min(
+                    1.0,
+                    max(0.2, kelly_fractional * f_star / 0.05),
+                )
+            )
+        n_names = len(tickers)
+        if use_kelly_weights:
+            alloc, invested = _nav_fractions_kelly(
+                pred_a,
+                ps,
+                max_weight,
+                temperature=kelly_temperature,
+                blend_equal=kelly_blend_equal,
+            )
+        else:
+            w_each = min(1.0 / n_names, max_weight)
+            alloc = np.full(n_names, w_each * ps, dtype=float)
+            invested = float(np.sum(alloc))
         cash_weight = 1.0 - invested
 
-        # Turnover and friction costs (approx):
-        # - turnover = fraction of invested basket that changes
-        # - cost applied on notional traded (entry/exit) at rebalance
+        # Turnover (diagnostic): fraction of sleeve that changed names vs prior rebalance
         new_holdings = set(tickers)
         if not prev_holdings:
             turnover = invested  # entering positions from cash
         else:
-            # approximate: changed names / current names
             changed = len(new_holdings.symmetric_difference(prev_holdings))
             denom = max(1, len(new_holdings.union(prev_holdings)))
             turnover = invested * (changed / denom)
 
-        # total bps cost on traded notional (STT+fees+slippage proxy)
-        total_cost_rate = (trade_cost_bps + slippage_bps) / 10000.0
-        friction_cost = pv * turnover * total_cost_rate
+        # STT + slippage: flat rate on total equity trade value at this rebalance (₹ terms)
+        trade_value = float(pv_start * invested)
+        friction_cost = trade_value * float(rebalance_friction_rate)
 
         stock_rets = []
         stopped = []
@@ -451,30 +657,40 @@ def run_backtest_daily(
                 exit_px = float(window.iloc[-1])
                 stock_rets.append(exit_px / entry - 1.0)
 
-        gross_stock_ret = float(np.mean(stock_rets)) if stock_rets else 0.0
-        port_ret_gross = invested * gross_stock_ret  # cash returns 0
-        port_ret = port_ret_gross - (friction_cost / pv if pv > 0 else 0.0)
+        stock_rets_arr = np.asarray(stock_rets, dtype=float)
+        if use_kelly_weights:
+            port_ret_gross = float(np.dot(alloc, stock_rets_arr)) if len(alloc) else 0.0
+        else:
+            gross_stock_ret = float(np.mean(stock_rets_arr)) if len(stock_rets_arr) else 0.0
+            port_ret_gross = invested * gross_stock_ret  # cash returns 0
+        port_ret = port_ret_gross - (friction_cost / pv_start if pv_start > 0 else 0.0)
         if regime == 2:
             port_ret = float(max(port_ret, -0.05))
 
         if port_ret <= -portfolio_dd_cash_trigger:
             forced_cash_next = True
 
-        pv = pv * (1.0 + port_ret)
+        pv = pv_start * (1.0 + port_ret)
         results.append(
             {
                 "date": d0,
                 "portfolio_return": port_ret,
                 "portfolio_return_gross": port_ret_gross,
+                "trade_value": trade_value,
                 "friction_cost": float(friction_cost),
+                "rebalance_friction_rate": float(rebalance_friction_rate),
                 "turnover": float(turnover),
                 "regime": ["HIGH_VOL", "BULL", "BEAR"][regime],
                 "stocks_held": tickers,
                 "stops_hit": stopped,
                 "cash": False,
+                "portfolio_value_start": pv_start,
                 "portfolio_value": pv,
                 "cash_weight": cash_weight,
                 "invested_weight": invested,
+                "kelly_f_star": float(f_star),
+                "kelly_b_used": float(kb_here),
+                "kelly_largest_weight": float(np.max(alloc)) if len(alloc) else 0.0,
             }
         )
         prev_holdings = new_holdings

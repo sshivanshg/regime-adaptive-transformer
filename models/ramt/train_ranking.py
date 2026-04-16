@@ -142,6 +142,240 @@ def _rebalance_dates_21d(
     return dates[::step_size]
 
 
+def _nifty_raw_path() -> str:
+    root = Path("data/raw")
+    pq = root / "_NSEI.parquet"
+    if pq.is_file():
+        return str(pq)
+    csv = root / "_NSEI_raw.csv"
+    if csv.is_file():
+        return str(csv)
+    raise FileNotFoundError(f"Expected {pq} or {csv}")
+
+
+def _full_nifty_trading_calendar(nifty_path: str) -> pd.DatetimeIndex:
+    p = Path(nifty_path)
+    if p.suffix == ".parquet":
+        df = pd.read_parquet(p, columns=["Date"])
+    else:
+        df = pd.read_csv(p, usecols=["Date"])
+    df["Date"] = pd.to_datetime(df["Date"])
+    return pd.DatetimeIndex(df["Date"].sort_values().unique())
+
+
+def _last_trading_day_before(cal: pd.DatetimeIndex, ts: pd.Timestamp) -> pd.Timestamp:
+    sub = cal[cal < pd.Timestamp(ts)]
+    if len(sub) == 0:
+        return pd.Timestamp(ts)
+    return pd.Timestamp(sub[-1])
+
+
+def _train_ramt_combined_fold(
+    store: LazyTickerStore,
+    tickers: list[str],
+    train_start: str,
+    train_end_inclusive: str,
+    max_epochs: int | None,
+    plot_dir: str | None,
+    save_artifacts: bool,
+    fold_label: str,
+) -> tuple[object, RobustScaler, RobustScaler, float, float]:
+    """
+    Fit scaler + y transforms on training keys only, then train RAMT (train + val loaders).
+    """
+    train_keys = _build_sample_keys_from_store(store, tickers, train_start, train_end_inclusive, SEQ_LEN)
+    val_start = (pd.Timestamp(train_end_inclusive) - pd.DateOffset(months=6)).strftime("%Y-%m-%d")
+    val_keys = _build_sample_keys_from_store(store, tickers, val_start, train_end_inclusive, SEQ_LEN)
+    train_keys_final = [k for k in train_keys if k not in set(val_keys)]
+
+    data_sc: dict[str, TickerData] = {}
+    for t in tickers:
+        td = store.get(t)
+        data_sc[t] = TickerData(
+            ticker=t,
+            ticker_id=int(TICKER_TO_ID.get(t, 0)),
+            dates=td["dates"],  # type: ignore[arg-type]
+            X=td["X"],  # type: ignore[arg-type]
+            y_monthly=td["y_m"],  # type: ignore[arg-type]
+            y_daily=td["y_d"],  # type: ignore[arg-type]
+            y_monthly_raw=td["y_m"],  # type: ignore[arg-type]
+            y_daily_raw=td["y_d"],  # type: ignore[arg-type]
+            regime=td["r"],  # type: ignore[arg-type]
+        )
+
+    if len(train_keys_final) < 100:
+        raise RuntimeError(
+            f"{fold_label}: insufficient training keys ({len(train_keys_final)}). "
+            f"train_end_inclusive={train_end_inclusive}"
+        )
+
+    scaler = _fit_scaler_on_train(data_sc, train_keys_final)
+
+    y_train_raw = np.asarray(
+        [float(data_sc[t].y_monthly_raw[i]) for t, i in train_keys_final], dtype=np.float32
+    )
+    lo_b = float(np.nanpercentile(y_train_raw, 1.0))
+    hi_b = float(np.nanpercentile(y_train_raw, 99.0))
+    patched_w: dict[str, TickerData] = {}
+    for t, td in data_sc.items():
+        y_raw_w = _winsorize_with_bounds(td.y_monthly_raw, lo_b, hi_b)
+        patched_w[t] = TickerData(
+            ticker=td.ticker,
+            ticker_id=td.ticker_id,
+            dates=td.dates,
+            X=td.X,
+            y_monthly=y_raw_w.copy(),
+            y_daily=td.y_daily,
+            y_monthly_raw=y_raw_w,
+            y_daily_raw=td.y_daily_raw,
+            regime=td.regime,
+        )
+    data_sc = patched_w
+
+    y_scaler = _fit_y_scaler_on_train(data_sc, train_keys_final)
+
+    train_ds = MultiTickerSequenceDataset(
+        store,
+        sorted(train_keys_final),
+        SEQ_LEN,
+        feature_scaler=scaler,
+        y_scaler=y_scaler,
+        y_winsor_lo=lo_b,
+        y_winsor_hi=hi_b,
+    )
+    val_ds = MultiTickerSequenceDataset(
+        store,
+        sorted(val_keys),
+        SEQ_LEN,
+        feature_scaler=scaler,
+        y_scaler=y_scaler,
+        y_winsor_lo=lo_b,
+        y_winsor_hi=hi_b,
+    )
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False, num_workers=0)
+
+    model = build_ramt({"seq_len": SEQ_LEN, "num_heads": NUM_HEADS, "dropout": MODEL_DROPOUT}).to(DEVICE)
+    criterion = CombinedLoss(lambda_dir=LAMBDA_DIR)
+    optimizer = AdamW(model.parameters(), lr=WARMUP_LR_END, weight_decay=WEIGHT_DECAY)
+    plateau = ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=2,
+        min_lr=1e-7,
+    )
+    global_step = [0]
+
+    n_epochs = int(max_epochs) if max_epochs is not None else int(MAX_EPOCHS)
+    epoch_nums: list[int] = []
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    lr_snapshots: list[float] = []
+
+    print(
+        f"{fold_label}: train_samples={len(train_ds)} val_samples={len(val_ds)} epochs<={n_epochs}",
+        flush=True,
+    )
+
+    best = float("inf")
+    best_state = None
+    patience_ctr = 0
+    for epoch in range(n_epochs):
+        tr_m = _train_one_epoch(model, train_loader, optimizer, criterion, global_step=global_step)
+        v = _eval_loss(model, val_loader, criterion)
+        if global_step[0] >= WARMUP_STEPS:
+            plateau.step(v)
+        lr_now = float(optimizer.param_groups[0]["lr"])
+        epoch_nums.append(epoch + 1)
+        train_losses.append(float(tr_m))
+        val_losses.append(float(v))
+        lr_snapshots.append(lr_now)
+        print(
+            f"  [{fold_label}] epoch {epoch + 1:02d}/{n_epochs}  train_loss={tr_m:.6f}  "
+            f"val_loss={v:.6f}  lr={lr_now:.2e}",
+            flush=True,
+        )
+        if v < best:
+            best = v
+            patience_ctr = 0
+            best_state = {k: vv.clone() for k, vv in model.state_dict().items()}
+        else:
+            patience_ctr += 1
+        if patience_ctr >= PATIENCE:
+            break
+        if DEVICE.type == "mps":
+            torch.mps.empty_cache()
+
+    if plot_dir and save_artifacts:
+        _save_training_run_artifacts(
+            Path(plot_dir),
+            epoch_nums,
+            train_losses,
+            val_losses,
+            lr_snapshots,
+            int(global_step[0]),
+        )
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    return model, scaler, y_scaler, lo_b, hi_b
+
+
+def _predict_rows_for_dates(
+    dates: pd.DatetimeIndex,
+    *,
+    store: LazyTickerStore,
+    tickers: list[str],
+    model: object,
+    scaler: RobustScaler,
+    y_scaler: RobustScaler,
+    lo_b: float,
+    hi_b: float,
+    inference_warmup_days: int,
+) -> list[dict[str, object]]:
+    """Inference on fixed calendar dates; requires SEQ_LEN + warmup rows of history per ticker."""
+    min_i = SEQ_LEN + int(inference_warmup_days)
+    rows: list[dict[str, object]] = []
+    for d in dates:
+        dts = pd.Timestamp(d)
+        period = "Train" if dts <= pd.Timestamp(TRAIN_END) else "Test"
+        for t in tickers:
+            td = store.get(t)
+            d_arr = td["dates"]
+            try:
+                i = int(d_arr.get_loc(dts))
+            except KeyError:
+                continue
+            if i < min_i:
+                continue
+            X_raw = td["X"][i - SEQ_LEN : i]
+            Xseq = (
+                torch.from_numpy(scaler.transform(X_raw.astype(np.float64)).astype(np.float32))
+                .float()
+                .unsqueeze(0)
+                .to(DEVICE)
+            )
+            r = torch.tensor([int(td["r"][i])], dtype=torch.long).to(DEVICE)
+            tid = torch.tensor([int(TICKER_TO_ID.get(t, 0))], dtype=torch.long).to(DEVICE)
+            with torch.no_grad():
+                pred_m_sc, _pred_d, _g = model(Xseq, r, ticker_id=tid)
+            pred_m = float(y_scaler.inverse_transform([[float(pred_m_sc.cpu().numpy().squeeze())]])[0][0])
+            y_raw = float(td["y_m"][i])
+            actual_w = float(np.clip(y_raw, lo_b, hi_b))
+            rows.append(
+                {
+                    "Date": dts,
+                    "Ticker": t,
+                    "predicted_alpha": float(pred_m),
+                    "actual_alpha": actual_w,
+                    "Period": period,
+                }
+            )
+    return rows
+
+
 @dataclass(frozen=True)
 class TickerData:
     ticker: str
@@ -561,322 +795,121 @@ def combined_walk_forward(
     start: str = "2016-01-01",
     end: str = "2024-12-31",
     test_steps: int = 3,
-    step_size: int = 21,
+    training_step: int = 126,
+    rebalance_step: int = 21,
+    step_size: int | None = None,
+    inference_warmup_days: int = 30,
     max_epochs: int | None = None,
     plot_dir: str | None = "results",
 ) -> pd.DataFrame:
     """
-    Walk-forward on combined dataset.
+    Combined RAMT with **decoupled** walk-forward training vs inference cadence.
 
-    Key difference from old approach:
-    Train on ALL tickers simultaneously.
-    Test on ALL tickers.
+    - **training_step** (default 126 trading days ≈ 6 months): retrain the model each time
+      the out-of-sample calendar advances by this step. Training uses all history strictly
+      before the first prediction date of that segment (expanding window; after the first
+      segment, labels from realized test months are included — standard production-style WF).
+    - **rebalance_step** (default 21): inside each segment, inference runs on every
+      rebalance date on this NIFTY trading-day grid (no training between these dates).
+    - **inference_warmup_days** (default 30): require at least ``SEQ_LEN + warmup`` rows
+      of history before scoring a ticker (stricter than sequence length alone).
 
-    At each fold:
-    1. Combine training data from all tickers
-    2. Train one RAMT model
-    3. Score all tickers on test period
-    4. Rank by predicted monthly alpha
-    5. Evaluate: did top 5 beat NIFTY?
+    Legacy: if ``step_size`` is passed, it overrides ``rebalance_step`` for backward compatibility.
     """
-    # Blind split protocol (no walk-forward leakage)
+    if step_size is not None:
+        rebalance_step = int(step_size)
+
     store = LazyTickerStore("data/processed", cache_size=6)
     tickers = list(TICKERS)
     if not tickers:
         raise FileNotFoundError("No processed parquet feature files found under data/processed.")
 
-    train_keys = _build_sample_keys_from_store(store, tickers, TRAIN_START, TRAIN_END, SEQ_LEN)
-    test_keys = _build_sample_keys_from_store(store, tickers, TEST_START, TEST_END, SEQ_LEN)
+    nifty_path = _nifty_raw_path()
+    full_cal = _full_nifty_trading_calendar(nifty_path)
 
-    # Validation split: last 6 months of training
-    val_start = "2022-07-01"
-    val_keys = _build_sample_keys_from_store(store, tickers, val_start, TRAIN_END, SEQ_LEN)
-    train_keys_final = [k for k in train_keys if k not in set(val_keys)]
-
-    # Fit feature scaler on TRAIN ONLY (leakage prevention)
-    # We fit on a deterministic subset via RobustScaler in _fit_scaler_on_train.
-    # Build a temporary in-memory view for fitting by reading X vectors via cache.
-    # (The scaler implementation in this file expects dict[str,TickerData], so we
-    # keep using the existing helper by materializing just the samples we need.)
-    # Instead, we create a lightweight dict using the store arrays.
-    data_sc: dict[str, TickerData] = {}
-    for t in tickers:
-        td = store.get(t)
-        data_sc[t] = TickerData(
-            ticker=t,
-            ticker_id=int(TICKER_TO_ID.get(t, 0)),
-            dates=td["dates"],  # type: ignore[arg-type]
-            X=td["X"],  # type: ignore[arg-type]
-            y_monthly=td["y_m"],  # type: ignore[arg-type]
-            y_daily=td["y_d"],  # type: ignore[arg-type]
-            y_monthly_raw=td["y_m"],  # type: ignore[arg-type]
-            y_daily_raw=td["y_d"],  # type: ignore[arg-type]
-            regime=td["r"],  # type: ignore[arg-type]
+    # Outer calendar: 6-month (126d) test segments; inner: 21d predictions per segment.
+    segment_starts = _rebalance_dates_21d(
+        nifty_path, TEST_START, TEST_END, step_size=int(training_step)
+    )
+    if len(segment_starts) == 0:
+        raise RuntimeError(
+            f"No walk-forward segments for TEST_START={TEST_START} TEST_END={TEST_END} "
+            f"training_step={training_step}"
         )
 
-    scaler = _fit_scaler_on_train(data_sc, train_keys_final)
-    # Scaling is applied in LazyMultiTickerSequenceDataset / inference (no full-matrix materialize).
+    all_rows: list[dict[str, object]] = []
 
-    # winsor + y_scaler fit on train only
-    y_train_raw = np.asarray([float(data_sc[t].y_monthly_raw[i]) for t, i in train_keys_final], dtype=np.float32)
-    lo_b = float(np.nanpercentile(y_train_raw, 1.0))
-    hi_b = float(np.nanpercentile(y_train_raw, 99.0))
-    patched_w: dict[str, TickerData] = {}
-    for t, td in data_sc.items():
-        y_raw_w = _winsorize_with_bounds(td.y_monthly_raw, lo_b, hi_b)
-        patched_w[t] = TickerData(
-            ticker=td.ticker,
-            ticker_id=td.ticker_id,
-            dates=td.dates,
-            X=td.X,
-            y_monthly=y_raw_w.copy(),
-            y_daily=td.y_daily,
-            y_monthly_raw=y_raw_w,
-            y_daily_raw=td.y_daily_raw,
-            regime=td.regime,
-        )
-    data_sc = patched_w
-
-    y_scaler = _fit_y_scaler_on_train(data_sc, train_keys_final)
-
-    train_ds = MultiTickerSequenceDataset(
-        store,
-        sorted(train_keys_final),
-        SEQ_LEN,
-        feature_scaler=scaler,
-        y_scaler=y_scaler,
-        y_winsor_lo=lo_b,
-        y_winsor_hi=hi_b,
-    )
-    val_ds = MultiTickerSequenceDataset(
-        store,
-        sorted(val_keys),
-        SEQ_LEN,
-        feature_scaler=scaler,
-        y_scaler=y_scaler,
-        y_winsor_lo=lo_b,
-        y_winsor_hi=hi_b,
-    )
-    test_ds = MultiTickerSequenceDataset(
-        store,
-        sorted(test_keys),
-        SEQ_LEN,
-        feature_scaler=scaler,
-        y_scaler=y_scaler,
-        y_winsor_lo=lo_b,
-        y_winsor_hi=hi_b,
-    )
-
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False, num_workers=0)
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False, num_workers=0)
-
-    model = build_ramt({"seq_len": SEQ_LEN, "num_heads": NUM_HEADS, "dropout": MODEL_DROPOUT}).to(DEVICE)
-    criterion = CombinedLoss(lambda_dir=LAMBDA_DIR)
-    optimizer = AdamW(model.parameters(), lr=WARMUP_LR_END, weight_decay=WEIGHT_DECAY)
-    plateau = ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.5,
-        patience=2,
-        min_lr=1e-7,
-    )
-    global_step = [0]
-
-    n_epochs = int(max_epochs) if max_epochs is not None else int(MAX_EPOCHS)
-    epoch_nums: list[int] = []
-    train_losses: list[float] = []
-    val_losses: list[float] = []
-    lr_snapshots: list[float] = []
-
-    best = float("inf")
-    best_state = None
-    patience = 0
-    for epoch in range(n_epochs):
-        tr_m = _train_one_epoch(model, train_loader, optimizer, criterion, global_step=global_step)
-        v = _eval_loss(model, val_loader, criterion)
-        if global_step[0] >= WARMUP_STEPS:
-            plateau.step(v)
-        lr_now = float(optimizer.param_groups[0]["lr"])
-        epoch_nums.append(epoch + 1)
-        train_losses.append(float(tr_m))
-        val_losses.append(float(v))
-        lr_snapshots.append(lr_now)
-        print(
-            f"  epoch {epoch + 1:02d}/{n_epochs}  train_loss={tr_m:.6f}  val_loss={v:.6f}  lr={lr_now:.2e}",
-            flush=True,
-        )
-        if v < best:
-            best = v
-            patience = 0
-            best_state = {k: vv.clone() for k, vv in model.state_dict().items()}
+    for seg_idx, seg_start in enumerate(segment_starts):
+        if seg_idx == 0:
+            train_end_inclusive = TRAIN_END
         else:
-            patience += 1
-        if patience >= PATIENCE:
-            break
-        if DEVICE.type == "mps":
-            torch.mps.empty_cache()
-    if plot_dir:
-        _save_training_run_artifacts(
-            Path(plot_dir),
-            epoch_nums,
-            train_losses,
-            val_losses,
-            lr_snapshots,
-            int(global_step[0]),
-        )
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    # Predict on rebalance dates across full period, label Period
-    rebal_all = _rebalance_dates_21d("data/raw/_NSEI.parquet", TRAIN_START, TEST_END, step_size=step_size)
-    rows: list[dict[str, object]] = []
-    for t in tickers:
-        td = store.get(t)
-        dates = td["dates"]
-        for d in rebal_all:
-            try:
-                i = int(dates.get_loc(pd.Timestamp(d)))
-            except KeyError:
-                continue
-            if i < SEQ_LEN:
-                continue
-            X_raw = td["X"][i - SEQ_LEN : i]
-            Xseq = (
-                torch.from_numpy(scaler.transform(X_raw.astype(np.float64)).astype(np.float32))
-                .float()
-                .unsqueeze(0)
-                .to(DEVICE)
-            )
-            r = torch.tensor([int(td["r"][i])], dtype=torch.long).to(DEVICE)
-            tid = torch.tensor([int(TICKER_TO_ID.get(t, 0))], dtype=torch.long).to(DEVICE)
-            with torch.no_grad():
-                pred_m_sc, _pred_d, _g = model(Xseq, r, ticker_id=tid)
-            pred_m = float(y_scaler.inverse_transform([[float(pred_m_sc.cpu().numpy().squeeze())]])[0][0])
-            y_raw = float(td["y_m"][i])
-            actual_w = float(np.clip(y_raw, lo_b, hi_b))
-            period = "Train" if pd.Timestamp(d) <= pd.Timestamp(TRAIN_END) else "Test"
-            rows.append(
-                {
-                    "Date": pd.Timestamp(d),
-                    "Ticker": t,
-                    "predicted_alpha": float(pred_m),
-                    "actual_alpha": actual_w,
-                    "Period": period,
-                }
+            train_end_inclusive = _last_trading_day_before(full_cal, pd.Timestamp(seg_start)).strftime(
+                "%Y-%m-%d"
             )
 
-    return pd.DataFrame(rows).sort_values(["Date", "predicted_alpha"], ascending=[True, False])
+        fold_label = f"WF seg {seg_idx + 1}/{len(segment_starts)} train_end<={train_end_inclusive}"
 
-    # NOTE: legacy walk-forward implementation exists below in this file but is
-    # unreachable. The project now uses a hard blind split for integrity.
-
-    # Determine fold boundaries by trading-day steps (21 trading days ≈ 1 month)
-    rebal_dates = _rebalance_dates_21d("data/raw/_NSEI.parquet", start, end, step_size=step_size)
-    predictions_rows: list[dict[str, object]] = []
-
-    for fold_i in range(6, len(rebal_dates) - test_steps):
-        train_start = pd.Timestamp(start)
-        train_end = pd.Timestamp(rebal_dates[fold_i])
-        test_start = train_end
-        test_end = pd.Timestamp(rebal_dates[fold_i + test_steps])
-
-        # Build per-ticker sample keys (daily training, daily val/test)
-        train_keys: list[tuple[str, int]] = []
-        test_keys: list[tuple[str, int]] = []
-        for t, td in data.items():
-            train_keys.extend(_build_sample_keys(td, train_start, train_end, SEQ_LEN))
-            test_keys.extend(_build_sample_keys(td, test_start, test_end, SEQ_LEN))
-
-        if len(train_keys) < 1000 or len(test_keys) < 200:
-            continue
-
-        # Validation = last 15% of train keys (time-ordered within each ticker not guaranteed,
-        # but combined training is robust; we keep deterministic split)
-        val_size = max(1, int(len(train_keys) * 0.15))
-        train_keys_sorted = sorted(train_keys, key=lambda k: (k[0], k[1]))
-        val_keys = train_keys_sorted[-val_size:]
-        train_keys_final = train_keys_sorted[:-val_size]
-
-        scaler = _fit_scaler_on_train(data, train_keys_final)
-        data_sc = _apply_scaler(data, scaler)
-
-        train_ds = MultiTickerSequenceDataset(data_sc, train_keys_final, SEQ_LEN)
-        val_ds = MultiTickerSequenceDataset(data_sc, val_keys, SEQ_LEN)
-        test_ds = MultiTickerSequenceDataset(data_sc, test_keys, SEQ_LEN)
-
-        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
-        val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
-        test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
-
-        model = build_ramt({"seq_len": SEQ_LEN, "num_heads": NUM_HEADS, "dropout": MODEL_DROPOUT}).to(DEVICE)
-        criterion = CombinedLoss(lambda_dir=LAMBDA_DIR)
-        optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-
-        best = float("inf")
-        best_state = None
-        patience = 0
-
-        print(
-            f"\nFold {fold_i}: train<{train_start.date()}→{train_end.date()}> "
-            f"test<{test_start.date()}→{test_end.date()}> "
-            f"train_samples={len(train_ds)} val_samples={len(val_ds)} test_samples={len(test_ds)}",
-            flush=True,
+        model, scaler, y_scaler, lo_b, hi_b = _train_ramt_combined_fold(
+            store,
+            tickers,
+            TRAIN_START,
+            train_end_inclusive,
+            max_epochs,
+            plot_dir,
+            save_artifacts=bool(plot_dir) and seg_idx == 0,
+            fold_label=fold_label,
         )
 
-        for epoch in range(MAX_EPOCHS):
-            _ = _train_one_epoch(model, train_loader, optimizer, criterion)
-            v = _eval_loss(model, val_loader, criterion)
-            if v < best:
-                best = v
-                patience = 0
-                best_state = {k: v.clone() for k, v in model.state_dict().items()}
-            else:
-                patience += 1
-            if epoch == 0 or (epoch + 1) % 5 == 0:
-                print(f"  epoch {epoch+1:02d}/{MAX_EPOCHS} val_loss={v:.6f}", flush=True)
-            if patience >= PATIENCE:
-                break
-
-        if best_state is not None:
-            model.load_state_dict(best_state)
-
-        # Predict on rebalance dates inside test window
-        for t, td in data_sc.items():
-            ds = rebal_dates[(rebal_dates >= test_start) & (rebal_dates < test_end)]
-            if len(ds) == 0:
-                continue
-            for d in ds:
-                try:
-                    i = int(td.dates.get_loc(d))
-                except KeyError:
-                    continue
-                if i < SEQ_LEN:
-                    continue
-                Xseq = torch.from_numpy(td.X[i - SEQ_LEN : i]).float().unsqueeze(0).to(DEVICE)
-                r = torch.tensor([int(td.regime[i])], dtype=torch.long).to(DEVICE)
-                tid = torch.tensor([int(td.ticker_id)], dtype=torch.long).to(DEVICE)
-                with torch.no_grad():
-                    pred_m, _pred_d, _g = model(Xseq, r, ticker_id=tid)
-                predictions_rows.append(
-                    {
-                        "Date": pd.Timestamp(d),
-                        "Ticker": t,
-                        "predicted_alpha": float(pred_m.cpu().numpy().squeeze()),
-                        "actual_alpha": float(td.y_monthly[i]),
-                        "fold_train_end": train_end,
-                    }
-                )
-
-    if not predictions_rows:
-        return pd.DataFrame(
-            columns=["Date", "Ticker", "predicted_alpha", "actual_alpha", "fold_train_end"]
+        # Next segment start (exclusive upper bound for prediction dates in this fold)
+        seg_end_ts = (
+            pd.Timestamp(segment_starts[seg_idx + 1])
+            if seg_idx + 1 < len(segment_starts)
+            else pd.Timestamp(TEST_END) + pd.Timedelta(days=1)
+        )
+        pred_end = _last_trading_day_before(full_cal, seg_end_ts)
+        pred_dates = _rebalance_dates_21d(
+            nifty_path,
+            str(pd.Timestamp(seg_start).date()),
+            str(pred_end.date()),
+            step_size=int(rebalance_step),
         )
 
-    preds_df = pd.DataFrame(predictions_rows).sort_values(
-        ["Date", "predicted_alpha"], ascending=[True, False]
-    )
-    return preds_df
+        fold_rows = _predict_rows_for_dates(
+            pred_dates,
+            store=store,
+            tickers=tickers,
+            model=model,
+            scaler=scaler,
+            y_scaler=y_scaler,
+            lo_b=lo_b,
+            hi_b=hi_b,
+            inference_warmup_days=inference_warmup_days,
+        )
+        all_rows.extend(fold_rows)
+
+        # First segment only: also emit train-window predictions (same model, 21d grid).
+        if seg_idx == 0:
+            train_pred_dates = _rebalance_dates_21d(
+                nifty_path, TRAIN_START, TRAIN_END, step_size=int(rebalance_step)
+            )
+            train_rows = _predict_rows_for_dates(
+                train_pred_dates,
+                store=store,
+                tickers=tickers,
+                model=model,
+                scaler=scaler,
+                y_scaler=y_scaler,
+                lo_b=lo_b,
+                hi_b=hi_b,
+                inference_warmup_days=inference_warmup_days,
+            )
+            all_rows.extend(train_rows)
+
+    df = pd.DataFrame(all_rows)
+    if df.empty:
+        return df
+    df = df.drop_duplicates(subset=["Date", "Ticker"], keep="last")
+    return df.sort_values(["Date", "predicted_alpha"], ascending=[True, False])
 
 
 def train_fixed_and_predict(
