@@ -228,13 +228,17 @@ class RAMTDataset:
         if missing:
             raise ValueError(f"Missing feature columns for {self.ticker}: {missing}")
 
-        if TARGET_COL not in df.columns:
-            if TARGET_COL == "Sector_Alpha" and "Monthly_Alpha" in df.columns:
-                eff = "Monthly_Alpha"
-            else:
-                raise ValueError(f"Missing target {TARGET_COL} for {self.ticker}")
-        else:
+        if TARGET_COL in df.columns and df[TARGET_COL].notna().any():
             eff = TARGET_COL
+        elif TARGET_COL == "Sector_Alpha" and "Monthly_Alpha" in df.columns:
+            warnings.warn(
+                f"{self.ticker}: Sector_Alpha is missing/all-NaN; using Monthly_Alpha.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            eff = "Monthly_Alpha"
+        else:
+            raise ValueError(f"Missing usable target {TARGET_COL} for {self.ticker}")
 
         df = df.dropna(subset=[eff])
         # Daily_Return optional for single-ticker loaders; multi-ticker training sets it
@@ -348,19 +352,18 @@ class LazyTickerStore:
         missing = [c for c in ALL_FEATURE_COLS if c not in df.columns]
         if missing:
             raise ValueError(f"{ticker}: missing feature columns: {missing}")
-        if TARGET_COL not in df.columns:
-            if TARGET_COL == "Sector_Alpha" and "Monthly_Alpha" in df.columns:
-                warnings.warn(
-                    f"{ticker}: missing Sector_Alpha; using Monthly_Alpha until you re-run "
-                    "features/feature_engineering.py (sector-neutral panel step).",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                eff_target = "Monthly_Alpha"
-            else:
-                raise ValueError(f"{ticker}: missing {TARGET_COL}")
-        else:
+        if TARGET_COL in df.columns and df[TARGET_COL].notna().any():
             eff_target = TARGET_COL
+        elif TARGET_COL == "Sector_Alpha" and "Monthly_Alpha" in df.columns:
+            warnings.warn(
+                f"{ticker}: Sector_Alpha is missing/all-NaN; using Monthly_Alpha until you "
+                "re-run features/feature_engineering.py (sector-neutral panel step).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            eff_target = "Monthly_Alpha"
+        else:
+            raise ValueError(f"{ticker}: missing usable {TARGET_COL}")
 
         # Legacy / partial Parquet may omit Daily_Return; match features/feature_engineering.add_daily_target
         if "Daily_Return" not in df.columns:
