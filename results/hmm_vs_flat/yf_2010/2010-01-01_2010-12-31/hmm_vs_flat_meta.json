@@ -1,0 +1,7 @@
+{
+  "terminology": {
+    "hmm_conditioned": "Portfolio uses NIFTY HMM_Regime: bull / high-vol / bear sleeves (e.g. 100% / 50% / 20%) and regime-specific top-N.",
+    "regime_agnostic_flat": "Portfolio ignores HMM for sizing: full sleeve every regime (flat_regime_sizing). Same ranking inputs as the HMM run."
+  },
+  "historical_yfinance": "For pre-2020 windows use: scripts/fetch_nifty200.py --start --end --raw-dir, scripts/build_processed_range.py, scripts/momentum_predictions_from_features.py, then pass --raw-dir and --nifty-features here."
+}

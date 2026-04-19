@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 
 source .venv/bin/activate
 
-echo "Starting RAMT Dashboard..."
+echo "Starting Momentum + Regime dashboard..."
 echo "Open: http://localhost:8501"
 
 streamlit run dashboard/app.py \

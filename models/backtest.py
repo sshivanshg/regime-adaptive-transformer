@@ -537,6 +537,14 @@ def _sector_diversified_top_n(
     return out
 
 
+def _plain_top_n(month_df: pd.DataFrame, n_sel: int, score_col: str) -> pd.DataFrame:
+    """Top ``n_sel`` by ``score_col`` with no sector diversification."""
+    if month_df.empty or n_sel <= 0:
+        return month_df.iloc[0:0].copy()
+    ranked = month_df.sort_values(score_col, ascending=False)
+    return ranked.head(n_sel).reset_index(drop=True)
+
+
 def run_backtest_daily(
     predictions_df: pd.DataFrame,
     nifty_features_path: str,
@@ -561,6 +569,8 @@ def run_backtest_daily(
     kelly_blend_equal: float = 0.0,
     kelly_fractional: float = 0.25,
     kelly_scale_position: bool = False,
+    use_sector_cap: bool = True,
+    flat_regime_sizing: bool = False,
 ) -> pd.DataFrame:
     """
     Daily-price backtest with risk rules.
@@ -586,6 +596,13 @@ def run_backtest_daily(
     - Max weight per stock: cap at `max_weight`, remainder stays cash.
     - If portfolio return <= -portfolio_dd_cash_trigger in a window:
         force next window to cash.
+
+    ``use_sector_cap``: when True (default), pick names with
+    ``_sector_diversified_top_n``; when False, plain top-``n_sel`` by score.
+
+    ``flat_regime_sizing``: when True, use full position size and ``top_n`` names
+    in every regime (no 50%/20% sleeves or HIGH_VOL top-3 rule); same
+    ``stop_loss`` for all regimes.
 
     Returns one row per rebalance window with trade/hold details.
     """
@@ -652,7 +669,11 @@ def run_backtest_daily(
             prev_holdings = set()
             continue
 
-        if regime == 2:
+        if flat_regime_sizing:
+            position_size = 1.0
+            n_sel = top_n
+            sl_stock = stop_loss
+        elif regime == 2:
             position_size = 0.2
             n_sel = min(5, top_n)
             sl_stock = stop_loss_bear
@@ -690,7 +711,11 @@ def run_backtest_daily(
             score_col = "score_adj"
         else:
             score_col = "predicted_alpha"
-        month_preds = _sector_diversified_top_n(month_df, n_sel, score_col)
+        month_preds = (
+            _sector_diversified_top_n(month_df, n_sel, score_col)
+            if use_sector_cap
+            else _plain_top_n(month_df, n_sel, score_col)
+        )
         if month_preds.empty:
             results.append(
                 {

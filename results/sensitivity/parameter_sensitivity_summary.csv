@@ -1,0 +1,8 @@
+variant,sharpe,cagr_pct,max_dd_pct,total_return_pct,n_windows,backtest_csv
+"Baseline (top-5, SL=7%, sector cap on, regime sizing on)",0.8335,13.49,-18.68,29.59,25,results/sensitivity/runs/backtest_Baseline_top-5_SL=7pct_sector_cap_on_regime_sizing_on.csv
+top-3,0.9931,15.62,-12.58,34.61,25,results/sensitivity/runs/backtest_top-3.csv
+top-7,0.6298,9.24,-22.42,19.84,25,results/sensitivity/runs/backtest_top-7.csv
+SL=5%,0.8335,13.49,-18.68,29.59,25,results/sensitivity/runs/backtest_SL=5pct.csv
+SL=10%,0.8335,13.49,-18.68,29.59,25,results/sensitivity/runs/backtest_SL=10pct.csv
+No sector cap,0.8108,18.02,-22.62,40.39,25,results/sensitivity/runs/backtest_No_sector_cap.csv
+No regime sizing (flat 1.0/1.0/1.0),1.3867,42.53,-19.68,106.63,25,results/sensitivity/runs/backtest_No_regime_sizing_flat_1.0-1.0-1.0.csv

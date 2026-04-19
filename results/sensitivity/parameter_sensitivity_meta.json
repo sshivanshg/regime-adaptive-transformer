@@ -1,0 +1,9 @@
+{
+  "predictions_source": "/Users/shivanshgupta/regime-adaptive-transformer/results/ranking_predictions.csv",
+  "test_window": [
+    "2024-01-01",
+    "2026-04-16"
+  ],
+  "metrics_note": "Sharpe/CAGR/MaxDD aligned with dashboard: sqrt(12) on window returns; CAGR from span_years",
+  "stop_loss_caveat": "In models/backtest.py run_backtest_daily, per-stock stops set sl_stock and flags stops_hit but realized window returns still use the full price path (_window_period_return). So varying stop_loss alone may duplicate metrics until stop-outs are applied to returns."
+}

@@ -55,6 +55,32 @@ HMM_MIN_OBS = 60
 # Required columns in raw parquet files created by scripts/fetch_nifty200.py
 RAW_REQUIRED_COLS = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]
 
+
+def configure_pipeline(
+    *,
+    raw_dir: Path | str | None = None,
+    processed_dir: Path | str | None = None,
+    start_date: str | None = None,
+    end_date_exclusive: str | None = None,
+) -> None:
+    """
+    Override default ``data/raw``, ``data/processed``, and the feature calendar window.
+
+    Used for historical yfinance downloads (e.g. 2008–2010) into a separate raw folder
+    without touching the default 2020+ pipeline.
+    """
+    global RAW_DIR, PROCESSED_DIR, NIFTY_BENCHMARK_PARQUET, START_DATE, END_DATE_EXCLUSIVE
+    if raw_dir is not None:
+        RAW_DIR = Path(raw_dir).resolve()
+        NIFTY_BENCHMARK_PARQUET = RAW_DIR / "_NSEI.parquet"
+    if processed_dir is not None:
+        PROCESSED_DIR = Path(processed_dir).resolve()
+    if start_date is not None:
+        START_DATE = start_date
+    if end_date_exclusive is not None:
+        END_DATE_EXCLUSIVE = end_date_exclusive
+
+
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------

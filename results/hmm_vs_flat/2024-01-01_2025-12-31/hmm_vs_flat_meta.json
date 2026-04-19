@@ -1,0 +1,7 @@
+{
+  "terminology": {
+    "hmm_conditioned": "Portfolio uses NIFTY HMM_Regime: bull / high-vol / bear sleeves (e.g. 100% / 50% / 20%) and regime-specific top-N.",
+    "regime_agnostic_flat": "Portfolio ignores HMM for sizing: full sleeve every regime (flat_regime_sizing). Same ranking inputs as the HMM run."
+  },
+  "note_2008_2010": "This repository's processed prices and ranking_predictions.csv start around 2020. A 2008\u20132010 window requires extended historical OHLCV + feature pipeline and new rankings."
+}

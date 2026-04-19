@@ -1,673 +1,198 @@
-## RAMT — Regime-Adaptive Monthly Stock Ranking (NIFTY)
+# RAMT
 
-This repo builds a **Strategic/Tactical hybrid** trading research system:
+*A 3rd-year capstone on Indian equity alpha. What I built, what broke, what actually worked.*
 
-- **Strategic head (primary)**: a Transformer-based RAMT model ranks NIFTY stocks by expected **next-month outperformance vs NIFTY**.
-- **Tactical head (sanity check)**: the same model also predicts **next-day return** to flag “vibe divergence” (e.g., monthly looks good but daily predicts a sharp drop).
-- **Regime filter**: a Gaussian **HMM regime label** (Bull / High-Vol / Bear) controls **position sizing** and “risk-off” behavior.
+I set out to train a regime-adaptive transformer to pick stocks from NIFTY 200. After a month of experiments, the clean backtest said the transformer was dead money next to simple momentum, and a three-line pandas sort beat the multi-stack model on the metrics I cared about. This is that story, written as honestly as I can.
 
----
+## The goal, stated honestly
 
-## Run the model (every time)
+I wanted to pick 5 stocks from NIFTY 200 each month, hold until the next rebalance with stops, and use an HMM-based regime signal to decide how much of the portfolio to put to work. On paper I aimed for directional accuracy above 54% and Sharpe above 1.0, because those were the academic targets that felt reasonable for a student project. What I actually wanted was simpler: beat NIFTY buy-and-hold by enough, after costs, that I could imagine allocating real money to the strategy and not feel foolish.
 
-Work from the **repository root**. Use the project virtualenv so `python` matches `requirements.txt`:
+## Phase 1 — the XGBoost baseline
+
+I started with daily return prediction using XGBoost. It was the obvious first move: fast to train, easy to inspect, good for iteration. The problem was not the algorithm but the target. Daily returns are almost pure noise at this granularity; whatever edge exists in Indian large-caps shows up cross-sectionally and on a monthly horizon, not as a clean per-name next-day move. I stopped trying to squeeze signal from tomorrow’s return and changed the label to 21-day forward alpha versus NIFTY. That single pivot mattered more than any hyperparameter I tuned before it.
+
+## Phase 2 — building RAMT
+
+This is the piece I actually wanted to build: a multimodal stack that could respect regimes instead of hiding them in a feature column.
+
+The pipeline looked like this: a `MultimodalEncoder` for price, technicals, volume, macro, and regime embeddings, then positional encoding, then `RegimeCrossAttention` so regime acted as the query rather than just another input vector. On top of that I used a mixture-of-experts layer with three transformer experts (bull, bear, high-vol flavor), dual prediction heads for monthly and daily horizons, and `TournamentRankingLoss` because the problem is ranking names within a date, not fitting a scalar return for each row in isolation.
+
+Data went in as roughly 200 tickers × 10 features × 30-day sequences. I trained walk-forward, refreshing every six months, on the order of 100k samples per fold depending on overlap. The target I trained against was `Sector_Alpha`, sector-neutralized monthly alpha built from `Monthly_Alpha` so the model wasn’t just learning sector bets.
+
+## The first honest numbers
+
+The dashboard showed Sharpe around 1.35 and CAGR near 23%. The real backtest file, the one written by `run_backtest_daily` with friction and risk rules, showed Sharpe 0.58 and CAGR about 2.9%. The gap was not a rounding error. The dashboard simulation was missing friction at 0.22% per rebalance, regime-based position sizing, stops, and the portfolio drawdown killswitch. Once those were in the same path as the returns, most of the headline alpha evaporated. I learned to trust the path that charges me to trade and forces me out when the rules say so, not the chart that only knows gross returns.
+
+## Three things that failed, and what they taught me
+
+### 1. The backtest had a date-alignment bug
+
+`run_backtest_daily` was building its rebalance grid from the NIFTY calendar while the predictions CSV marched on a different set of dates. The overlap was empty in practice, the portfolio kept going to cash, and I spent time debugging “strategy” when the bug was calendar alignment. The fix was to drive rebalance dates directly from the predictions file so the backtest and the model outputs share one timeline.
+
+### 2. RAMT trained for 3 epochs
+
+The config file said `MAX_EPOCHS=30` and `PATIENCE=8`, but the run script passed `--epochs 3` after a quick test and I never changed it back. Training loss was still falling, validation loss had barely moved, and per-date prediction standard deviation across 200 names was about 0.002, basically collapsed. Directional accuracy landed at 46.4%, below a coin flip, while Top-5 Sharpe on the dashboard still looked good. That was momentum leaking into the top picks, not a model that had learned a cross-sectional signal.
+
+### 3. Re-training properly still didn’t work
+
+I sped up the data loader (`num_workers=4`, `cache_size=250`) and cut wall time from about 8 hours to about 2 hours per heavy run. I simplified the architecture: dropped MoE to a single expert, trimmed heads and layers, and took parameters from roughly 500k down to 97k. I ran 25 epochs across four walk-forward folds. Validation correlation to the target went negative, about -0.036, and got worse every epoch. Predictions tightened further (validation σ around 0.0015). Training loss plateaued by epoch 2.
+
+The tournament ranking loss has a real failure mode: if scores collapse toward zero, pairwise margins vanish, gradients vanish, and nothing learns to separate names on a given day. I tried a stronger daily MSE anchor (`AUX_DAILY_WEIGHT` from 0.05 to 0.2) and restored some capacity (2 layers, 8 heads, 131k parameters). It ran 7 epochs before the negative-correlation curve was so obviously monotonic that I stopped wasting electricity.
+
+## The diagnostic that saved the project
+
+I had two dead training runs and no clean read on whether the transformer, the features, or the target was wrong.
+
+I wrote a small script, `scripts/baseline_feature_ic.py` (about 60 lines), that trains plain LightGBM on the same ten features on the same train and test split as the research setup. If LightGBM finds information coefficient and RAMT does not, the transformer is the problem. If neither finds anything, the features are the problem.
+
+The numbers were blunt:
+
+- LightGBM: IC = +0.021, IR = +6.41, top-5 positive alpha rate = 53.8%.
+- Pure `Ret_21d` momentum (no ML, just sort by 21-day return): IC = +0.0065, top-5 spread = +1.59% per month, top-5 positive rate = 56.3%.
+- RAMT: IC = -0.019, negatively correlated with the realized ranked target.
+
+A `df.sort_values("Ret_21d").head(5)` strategy with zero machine learning beat my multi-stack transformer on every metric that matters.
+
+## The pivot
+
+I stopped trying to rescue RAMT. The evidence said monthly cross-sectional alpha in NIFTY 200, at the data scale and model budget I had (97k–131k parameters), was dominated by short-horizon momentum, and the transformer wasn’t adding information on top of it.
+
+What I run now is deliberately boring. Each rebalance date I rank the 200 names by 21-day return, take the top 5 with at most one name per NSE sector so I do not end up with five defense stocks in a defense rally, size the book by HMM regime (100% in bull, 50% in high volatility, 20% in bear), apply a 7% per-stock stop and a 15% portfolio drawdown killswitch, and rebalance every 21 trading days. The “regime-adaptive” part of the project title moved from inside the neural net to the portfolio construction layer, which is a cleaner story than pretending the regime gate lived in the embedding space when it did not.
+
+## Final numbers
+
+Out-of-sample window from `2024-01-10` through `2026-01-27` on `results/backtest_results.csv`, with NIFTY buy-and-hold from `data/raw/_NSEI.parquet` over the same calendar span. Net of friction at 0.22% per rebalance when capital is deployed.
+
+Strategy vs NIFTY buy-and-hold:
+
+
+| Metric       | My strategy | NIFTY B&H | Edge   |
+| ------------ | ----------- | --------- | ------ |
+| CAGR         | 13.5%       | 7.7%      | +5.8pp |
+| Max drawdown | -18.7%      | -15.8%    | -2.9pp |
+| Sharpe (net) | 0.83        | 0.65      | +0.18  |
+| Win rate     | 64%         | 52%       | +12pp  |
+
+
+Sharpe for the strategy uses mean and standard deviation of rebalance-window returns in `backtest_results.csv`, annualized as mean divided by std times √12, matching `dashboard/app.py`. NIFTY Sharpe uses daily log returns on the index in that window, annualized with √252, same helper as the dashboard benchmark.
+
+₹1 lakh compounds to about ₹1.30 lakh on the strategy versus about ₹1.16 lakh on NIFTY over those two years. Not a hedge fund number. A real, tradeable band for an undergrad capstone.
+
+Full progression across the project (each row is a different experiment, not the same CSV):
+
+
+| Strategy                       | CAGR  | Max DD | Sharpe |
+| ------------------------------ | ----- | ------ | ------ |
+| NIFTY buy-and-hold             | 7.7%  | -15.8% | 0.65   |
+| RAMT transformer               | 2.9%  | -5.3%  | 0.58   |
+| Momentum + regime              | 18.0% | -22.6% | 0.81   |
+| Momentum + regime + sector cap | 13.5% | -18.7% | 0.83   |
+
+
+The last row is what `results/backtest_results.csv` represents today. The earlier rows are where the research actually traveled.
+
+## What I learned that I'll take to the next project
+
+- Build the backtest with realistic costs before you fall in love with a model architecture.
+- Any dashboard metric without friction will beat the number that includes turnover and stops; look at the path that charges you.
+- When training loss stalls by epoch 2 and validation correlation trends negative, more epochs are not the fix.
+- Short-horizon momentum is harder to beat than a first-year quant course suggests.
+- At student data scale, a small transparent rule often beats a big fragile stack.
+- Decide go or no-go metrics before you peek at the out-of-sample folder.
+- A sixty-line diagnostic that runs in minutes is worth more than another week of learning-rate grid search.
+
+## Project structure
+
+**Data pipeline**
+
+- `data/download.py` — pull Yahoo histories and benchmarks into `data/raw/`.
+- `data/nifty200_tickers.txt` — static universe list (2026 NIFTY 200 snapshot).
+- `data/raw/` — per-ticker and macro Parquet files; benchmark `data/raw/_NSEI.parquet` for NIFTY.
+- `data/processed/` — engineered feature Parquet per ticker (`*_features.parquet`).
+- `scripts/fetch_nifty200.py` — fetch official index constituents and save raw series.
+
+**Features**
+
+- `features/feature_engineering.py` — build the panel features, alphas, and benchmark alignment.
+- `features/sectors.py` — hand mapping from ticker to sector for the sector cap.
+
+**Model (kept for thesis ablation, not the live signal)**
+
+- `models/ramt/model.py` — RAMT module definitions.
+- `models/ramt/encoder.py` — multimodal encoder and regime attention wiring.
+- `models/ramt/moe.py` — mixture-of-experts transformer blocks.
+- `models/ramt/losses.py` — ranking and auxiliary losses.
+- `models/ramt/dataset.py` — sequence dataset for walk-forward training.
+- `models/ramt/train_ranking.py` — training loop, walk-forward orchestration, exports.
+- `models/attention_consistency_report.py`, `models/inspect_attention.py`, `models/permutation_importance.py` — analysis helpers around the old model path.
+
+`models/ramt/` stays in the repo for the thesis ablation chapter. The live strategy does not depend on it.
+
+**Baseline diagnostic**
+
+- `scripts/baseline_feature_ic.py` — LightGBM vs momentum vs RAMT exports on the same split.
+
+**Backtest**
+
+- `models/backtest.py` — `run_backtest_daily`, regime wiring, friction, stops, killswitch.
+- `models/run_final_2024_2026.py` — end-to-end runner (train or `--backtest-only`), writes `results/backtest_results.csv`.
+
+**Dashboard**
+
+- `dashboard/app.py` — Streamlit UI: curves, metrics, regime shading, benchmark comparison.
+- `dashboard/market_scraper.py`, `dashboard/market_pulse.py` — auxiliary market data helpers for the UI.
+
+**Scripts**
+
+- `scripts/build_momentum_predictions.py` — build the momentum-based ranking CSV the backtest consumes after the pivot.
+
+**Results and artifacts**
+
+- `results/backtest_results.csv` — authoritative per-rebalance performance for the final strategy.
+- `results/ranking_predictions.csv`, `results/monthly_rankings.csv` — model or momentum ranking exports.
+- `results/ramt_model_state*.pt`, `results/ramt_scaler*.joblib`, `results/ramt_y_scaler*.joblib` — saved weights and scalers from training runs.
+- `results/training_history.csv`, `results/training_dashboard.png`, `results/training_log_*.txt` — training traces.
+
+**Notebooks and docs**
+
+- `RAMT_Monolith_Trainer.ipynb`, `RAMT_Production_Pipeline.ipynb` — older exploration and pipeline notes.
+- `RAMT_CORE_AUDIT.md`, `FEATURES_AND_REGIMES.md`, `ATTENTION_EXPLAINABILITY.md` — design and audit notes.
+- `requirements.txt` — Python dependencies.
+- `run_dashboard.sh` — convenience launcher for Streamlit.
+- `checkpoints/` — legacy XGBoost and early PyTorch artifacts (`best.pt`, `xgboost.joblib`).
+
+## How to reproduce
 
 ```bash
-cd /path/to/regime-adaptive-transformer
-python3 -m venv .venv          # once per machine
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-**Full pipeline** (download → features → train + walk-forward + backtest):
-
-```bash
-source .venv/bin/activate
-python data/download.py
+# 1. Build features (assumes data/raw/ is populated)
 python features/feature_engineering.py
-python -m models.run_final_2024_2026
+
+# 2. Run the baseline diagnostic (the thing that motivated the pivot)
+python scripts/baseline_feature_ic.py
+
+# 3. Build the momentum predictions CSV
+python scripts/build_momentum_predictions.py
+
+# 4. Run the backtest
+python models/run_final_2024_2026.py --backtest-only
+
+# 5. Launch the dashboard
+streamlit run dashboard/app.py
 ```
 
-Optional **dashboard** (after a successful run):
+## Limitations
 
-```bash
-./run_dashboard.sh
-```
+The universe is static: the 200 tickers are a 2026 NIFTY 200 snapshot. I did not reconstruct historical index membership, so survivorship and membership drift are still there even though I was careful about time alignment inside the panel.
 
-| Step | What it does |
-|------|----------------|
-| `data/download.py` | Fetches/updates raw OHLCV parquets under `data/raw/`. |
-| `features/feature_engineering.py` | Builds processed parquets in `data/processed/` (features, `HMM_Regime`, **`Sector`**, **`Sector_Alpha`**, `Monthly_Alpha`, …). **Run this after any change to feature code or when you need fresh labels.** |
-| `python -m models.run_final_2024_2026` | Fits scalers + trains RAMT walk-forward, writes predictions and backtest CSVs under `results/`. |
+The out-of-sample window is about two years. The strategy has not lived through a 2008- or 2020-style crash in this backtest. I do not know how it behaves when correlations go to one and liquidity dries up.
 
-**Model-only rerun** (processed data unchanged): skip download; only run `models.run_final_2024_2026`. If training fails with missing **`Sector_Alpha`** / **`Sector`**, re-run **`features/feature_engineering.py`** end-to-end so the panel step fills sector-neutral targets.
+Rebalancing every 21 trading days is a choice. A shorter cadence would lean more on momentum; a longer one would blend in mean reversion. The result is not independent of that clock.
 
-**Notebook (optional):** `RAMT_Monolith_Trainer.ipynb` mirrors the same training stack for an all-in-one environment; keep it in sync with `models/ramt/train_ranking.py` when you change architecture.
+Friction is modeled as 0.22% of traded notional per rebalance. Real Indian market impact, especially on smaller names, is often worse.
 
-**Artifacts in `results/`** (typical):
+The HMM regime is closer to a volatility state machine than a return predictor. It cuts exposure in high-vol and bear labels, which helps drawdowns but also caps upside when the market rips.
 
-- `ranking_predictions.csv`, `monthly_rankings.csv`, `backtest_results.csv`
-- `ramt_model_state.pt`, `ramt_scaler.joblib`, `ramt_y_scaler.joblib` (for inference, dashboards, attention tools)
+## Acknowledgments
 
-**Note:** After architecture changes, old `ramt_model_state.pt` checkpoints may not load; retrain with the command above.
-
----
-
-## What exactly is the model predicting?
-
-### Strategic (monthly ranking target)
-- **`Monthly_Alpha`** = (stock forward 21-trading-day log return) − (NIFTY forward 21-trading-day log return) — benchmark-relative outperformance.
-- **`Sector_Alpha`** = `Monthly_Alpha` minus the **median `Monthly_Alpha` in the same (date, sector) cohort** — used as the primary training target when processed parquets include it (see `features/feature_engineering.py`). If `Sector_Alpha` is absent, the loader falls back to **`Monthly_Alpha`**.
-- **`Monthly_Alpha_Z`** = `Monthly_Alpha / trailing_21d_vol` (risk-adjusted variant; used in some audits / `permutation_importance` examples).
-
-### Tactical (daily sanity-check target)
-- **`Daily_Return`** = next-day `Log_Return` (shifted by -1)
-
-See: `FEATURES_AND_REGIMES.md` for the full feature list and regime explanation.
-
----
-
-## Portfolio strategy (what a human does)
-
-Every rebalance date (every **21 trading days** on the NIFTY calendar):
-
-1. Read NIFTY **HMM regime**:
-   - **Bull**: invest 100%, buy top 5
-   - **High-Vol**: invest 50%, buy top 3
-   - **Bear**: hold cash
-2. Buy the top-ranked stocks (by RAMT strategic score) and hold for the window.
-3. Risk rules during the window (in backtest):
-   - per-stock **stop loss** (default 7%)
-   - max weight per stock (default 20%)
-   - portfolio drawdown trigger → force cash next window (default 15%)
-4. Friction modeled (new):
-   - trade cost bps + slippage bps deducted based on turnover
-
----
-
-## Explainability: attention inspection (“Why filter”)
-
-We can inspect which days in the 30-day window the Transformer attends to.
-
-After running `models/run_final_2024_2026.py`, run:
-
-```bash
-.venv/bin/python models/inspect_attention.py --ticker TCS_NS --date 2024-10-09 --out-prefix tcs_2024_10_09
-.venv/bin/python models/attention_consistency_report.py --ticker TCS_NS --n 12
-```
-
-Docs: `ATTENTION_EXPLAINABILITY.md`
-
----
-
-## Feature importance audit (permutation importance)
-
-Use this to see if features like USD/INR, gold, VIX, etc. are actually helping.
-
-```bash
-.venv/bin/python models/permutation_importance.py --target Monthly_Alpha_Z --max-samples 8000
-```
-
-This writes `results/permutation_importance.csv` and prints top/bottom features.
-
----
-
-## Repository structure (current)
-
-```
-regime-adaptive-transformer/
-├── data/
-│   ├── download.py
-│   ├── raw/
-│   └── processed/
-├── features/
-│   └── feature_engineering.py
-├── models/
-│   ├── backtest.py
-│   ├── inspect_attention.py
-│   ├── attention_consistency_report.py
-│   ├── permutation_importance.py
-│   ├── run_final_2024_2026.py
-│   └── ramt/
-│       ├── dataset.py
-│       ├── encoder.py
-│       ├── moe.py
-│       ├── model.py
-│       ├── losses.py          # TournamentRankingLoss + CombinedLoss
-│       └── train_ranking.py   # walk-forward training, sector / y-scaler
-├── dashboard/
-│   └── app.py
-├── FEATURES_AND_REGIMES.md
-├── ATTENTION_EXPLAINABILITY.md
-├── FEATURES_AND_REGIMES.md
-├── requirements.txt
-└── README.md
-```
-
----
-
-## Learning Log (keep updating this)
-
-This section is intentionally “journal style”: **what changed** and **why**.
-
-### 2026-04-15 — Pivot: monthly ranking (vs daily prediction)
-- **Change**: switched target to `Monthly_Alpha` (21d stock return − 21d NIFTY return).
-- **Why**: daily returns are extremely noisy; ranking relative performance is more stable and directly actionable for portfolio construction.
-
-### 2026-04-15 — Added relative momentum + macro features
-- **Change**: added `RelMom_*` vs NIFTY and macro returns (USDINR, crude, gold, USVIX).
-- **Why**: momentum is a documented anomaly; macro series help explain sector sensitivity (e.g., USDINR for IT).
-
-### 2026-04-15 — Multi-ticker training with ticker embeddings
-- **Change**: combined training across the stock universe; added per-ticker embedding.
-- **Why**: increases sample count and lets model learn cross-stock patterns while still knowing “which stock” it’s scoring.
-
-### 2026-04-15 — Ranking-first loss (LambdaRank → MarginRanking)
-- **Change**: shifted monthly objective to a true ranking loss (order matters more than exact alpha).
-- **Why**: trading cares that “A > B”, not the precise 2% gap; ranking losses reduce flat regression behavior on noisy targets.
-
-### 2026-04-15 — Distance-based technical features (scale-free indicators)
-- **Change**: replaced absolute technical indicator levels with scale-free “distance” features:
-  - RSI uses `RSI_Z` (rolling z-score)
-  - Bollinger uses `BB_Dist_Upper` / `BB_Dist_Lower` instead of `BB_Upper` / `BB_Lower`
-- **Why**: makes ₹100 and ₹5000 stocks look comparable; reduces noise from absolute price scale and helps the Transformer + RobustScaler focus on patterns not price level.
-
-### 2026-04-15 — MPS (Metal) acceleration on Apple Silicon
-- **Change**: training now prefers `mps` device when available (then `cuda`, then `cpu`).
-- **Why**: on M2 Macs, using Metal GPU is typically faster and avoids CPU/RAM bottlenecks for Transformers.
-
-### 2026-04-15 — Added market friction + turnover cost model
-- **Change**: backtest now subtracts bps cost + slippage based on estimated turnover.
-- **Why**: most retail backtests fail in India by ignoring STT/slippage; turnover-aware realism is required.
-
-### 2026-04-15 — Risk-adjusted target `Monthly_Alpha_Z`
-- **Change**: added `Monthly_Alpha_Z = Monthly_Alpha / trailing_21d_vol` and use it in the final runner.
-- **Why**: avoids “junk” picks that outperform only through extreme volatility; prefers smoother outperformance.
-
-### 2026-04-15 — Dual-brain model (strategic + tactical heads)
-- **Change**: model now outputs monthly ranking score + daily return sanity-check.
-- **Why**: if daily head screams “crash” while monthly head is bullish, it’s a divergence worth investigating before deploying capital.
-
-### 2026-04-15 — Attention explainability + consistency audit
-- **Change**: added attention heatmaps + cross-date consistency report.
-- **Why**: explainability is a defense against overfitting; attention should show stable patterns rather than random focus.
-
----
-
-## Notes
-- This is a **research system**, not financial advice.
-- For reproducibility, prefer `.venv/bin/python ...` commands.
-
-**Last updated:** 2026-04-16
-
-| Tool | Role | Why we use it | Alternatives | Why this choice here |
-|------|------|---------------|--------------|----------------------|
-| **Python 3** | Language | Ecosystem for ML, data, and PyTorch | R, Julia | Broad libraries, hiring signal, PyTorch-first DL |
-| **NumPy / Pandas** | Arrays & time series | Fast columnar ops, alignment | Polars | Pandas ubiquitous for finance tutorials and team familiarity |
-| **yfinance** | OHLCV download | Free, simple | Polygon, Refinitiv | Zero API keys for coursework/research |
-| **scikit-learn** | Scaling, metrics, splits | `RobustScaler` (IQR), metric helpers | — | Industry default for preprocessing |
-| **XGBoost** | Gradient boosted trees baseline | Strong tabular performance, fast | LightGBM, CatBoost | Mature, well-documented; easy to justify |
-| **hmmlearn** | Gaussian HMM | Regime discovery from returns/vol | Bayesian HMM, HDP-HMM | Simple, fits pipeline scope |
-| **PyTorch** | Deep learning | Dynamic graphs, research flexibility | TensorFlow/JAX | Standard for custom architectures (MoE, encoders) |
-| **Matplotlib / Seaborn** | EDA plots | Publication-style plots | Plotly | Notebook-friendly |
-| **SciPy / statsmodels** | Stats / diagnostics | Complements EDA | — | Optional depth in notebooks |
-| **Jupyter** | Exploratory work | Interactive EDA | VS Code only | Standard for quantitative research |
-
-**Not used in this repo (by design):**
-
-| Category | Note |
-|----------|------|
-| **Backend / REST API** | No FastAPI/Flask service; batch inference via scripts. |
-| **Database** | Data on disk as CSV; no PostgreSQL/Redis. |
-| **Cloud SDK** | No vendor lock-in; run locally or bring your own container. |
-| **Dedicated experiment tracking** | No Weights & Biases / MLflow in `requirements.txt`; easy to add. |
-
----
-
-## 5. System architecture
-
-This project is a **batch ML pipeline**, not a client-server product. There is **no frontend** in the repository.
-
-```mermaid
-flowchart LR
-  subgraph sources["Data sources"]
-    YF[yfinance APIs]
-  end
-
-  subgraph local["Local pipeline"]
-    RAW[data/raw CSVs]
-    FE[feature_engineering.py]
-    PROC[data/processed CSVs]
-    BL[baselines: XGBoost / LSTM]
-    RAMT[models/ramt/train.py]
-    RES[results/*.csv]
-  end
-
-  YF --> RAW --> FE --> PROC --> BL --> RES
-  PROC --> RAMT --> RES
-```
-
-### Model training pipeline (RAMT)
-
-1. **Load** processed features for ticker `T` → `RAMTDataModule`.  
-2. **Define folds** (`get_walk_forward_indices`): expanding train, fixed step test.  
-3. **Per fold:** split train into train/val; **fit scaler on train**; build `DataLoader`s.  
-4. **Initialize** `RAMTModel` (fresh weights per fold in `train.py`).  
-5. **Optimize** `CombinedLoss` with **AdamW**, **cosine warm restarts**, **gradient clipping**, **early stopping** on validation loss.  
-6. **Predict** on test window; append to out-of-sample CSV.
-
-### Inference pipeline
-
-- **Inference = same forward pass** as training without gradients: `model(X, regime)` → prediction + gates. Implemented in `predict()` inside `models/ramt/train.py`. No separate GPU serving layer.
-
-### Data flow (conceptual)
-
-```
-Raw OHLCV → engineered features + regimes → scaled sequences → encoder → +position → MoE → ŷ
-                                              ↑
-                                    regime labels (parallel path)
-```
-
----
-
-## 6. Dataset
-
-### Source & format
-
-- **Source:** Public market data via **`yfinance`** (`data/download.py`).  
-- **Format:** Per-ticker CSV under `data/processed/` named `{TICKER}_features.csv` (e.g. `JPM_features.csv`, `RELIANCE_NS_features.csv`). **Git ignores** `data/processed/*.csv` by default (large files).
-
-### Scale (approximate)
-
-- **Horizon:** Configurable; default download window is roughly **2010–2026** for most tickers (see `data/download.py`; EPIGRAL uses a shorter window).  
-- **Rows:** Order of **thousands** of trading days per ticker after cleaning (exact count depends on listing and NaN drop). Example: ~**3.9k** rows for JPM in development logs.  
-- **RAMT input width:** **10** numeric features (`ALL_FEATURE_COLS` in `models/ramt/dataset.py`). The full engineered Parquet table has **more columns** (OHLCV, `Realized_Vol_20`, etc.); RAMT uses this **10-column** lean subset consistently in `MultimodalEncoder`.
-
-### Features & labels
-
-- **Features (groups):** lagged returns, realized volatility, Garman–Klass, vol ratio, RSI/MACD/Bollinger, momentum/ROC, volume ratios, **HMM_Regime**, **Rolling_Corr_Index** (see `features/feature_engineering.py` and `README` feature table below).  
-- **Label:** **Next-day** log return (`Log_Return` shifted), aligned so each `(X, y)` pair is **causal**.
-
-### Data quality & risks
-
-| Topic | Practice in this repo |
-|-------|------------------------|
-| **Missing values** | Engineering uses rolling windows; early rows may drop; pipeline aligns with supervised target. Phase 2 plan notes **zero NaNs** target in processed CSVs after completion. |
-| **Class imbalance** | **Regression** task; not class-balanced. XGBoost baseline may use **sample weights** on large moves (`baseline_xgboost.py`). |
-| **Noise** | Returns are **high noise**; metrics emphasize **robust** measures (DA%, Sharpe proxy) alongside RMSE. |
-| **Bias / survivorship** | Single-name equities; **not** a universe study—results **do not** claim market-wide generalization without further work. |
-| **Corporate actions** | Yahoo-adjusted prices typical via yfinance; **verify** for production use. |
-
-### Train / validation / test logic
-
-- **Blind production split (Parquet / `train_ranking`):** Training **2015–01-01 … 2022–12-31** (“history”); strict held-out test **2023–01-01 … 2026–04-15** (“real world”). `RobustScaler` for features and monthly labels is **fit only** on training keys—no 2023+ statistics leak into normalization (`LazyMultiTickerSequenceDataset` applies `transform` per batch). See `models/run_final_2024_2026.py`.
-- **Walk-forward (single-ticker / legacy):** Initial train fraction (e.g. **60%** of timeline), then **rolling test** blocks (e.g. **63** days), train expanding. **No random shuffle** of dates.  
-- **Validation:** Held out from the **training** segment of each fold (e.g. last **15%** of train indices in `RAMTDataModule.get_fold_loaders`, or mid-2022–end-2022 for the combined trainer).  
-- **Why these ratios:** They balance **enough history** to fit regimes/scaler with **many out-of-sample tests**—standard in finance backtesting (not arbitrary 80/10/10 i.i.d. splits).
-
----
-
-## 7. Data preprocessing
-
-| Step | What | Why | Effect |
-|------|------|-----|--------|
-| **Returns** | Log returns from closes | Stationarity-ish, scale-free | Stable inputs across tickers |
-| **Rolling indicators** | Vol, RSI, MACD, Bollinger, etc. | Encode momentum, risk, positioning | Nonlinear market state |
-| **HMM** | Gaussian HMM on selected series | Discrete **regime** proxy | Allows regime features + gating |
-| **Cross-asset correlation** | Rolling corr vs benchmark | Context for single-stock moves | Extra context feature |
-| **Scaling (RAMT/LSTM)** | `RobustScaler` **fit on train only** (features + monthly label); applied at batch/inference time | Comparable feature scales for neural nets | **Prevents leakage** from test into normalization |
-| **Sequence construction** | Last `seq_len` days → `X` | Temporal context for transformers/LSTM | Standard sequence modeling |
-| **Regime in RAMT** | Integer embedding + column in `X` | Categorical vs continuous treatment | Avoids false ordinality in embedding path |
-
-**Outliers:** No aggressive winsorization in core scripts; **financial extremes** are often informative—mitigated by **scaling**, **regularization**, and **walk-forward** testing.
-
----
-
-## 8. Machine learning concepts used
-
-**Extended definitions:** (glossary docs directory is currently not present in-tree; rely on this README + code as source of truth).
-
-| Concept | Definition / role | Applied here |
-|---------|-------------------|--------------|
-| **Supervised learning** | Learn \(f(X) \approx y\) from pairs | Next-day return regression |
-| **Regression** | Continuous target | RMSE, MAE |
-| **Bias–variance** | Underfit vs overfit tradeoff | Walk-forward + early stopping + dropout |
-| **Overfitting** | Memorizing noise | Mitigated by **val early stopping**, **regularization**, **simple baselines** |
-| **Cross-validation** | Not i.i.d. k-fold | **Walk-forward** only—time order preserved |
-| **Feature engineering** | Domain inputs vs raw prices | Lags, vol, technicals, HMM, correlation |
-| **Hyperparameters** | Config outside training | Learning rate, heads, experts, `lambda_dir` in scripts |
-| **Ensemble** | Combine models | **MoE** = weighted ensemble of **experts** (learned weights) |
-| **Regularization** | Penalize complexity | Weight decay, dropout, gradient clipping |
-| **Evaluation metrics** | Success criteria | RMSE/MAE for fit; **DA%** for direction; **Sharpe/Calmar** for risk-adjusted narrative |
-
----
-
-## 9. Deep learning concepts used
-
-**Extended definitions:** (glossary docs directory is currently not present in-tree; rely on this README + code as source of truth).
-
-| Concept | Theory (brief) | In this codebase |
-|---------|----------------|------------------|
-| **Neural network** | Composed linear + nonlinear layers | Encoders, experts, gates |
-| **Layers** | Linear, LayerNorm, Dropout, etc. | `encoder.py`, `moe.py`, `model.py` |
-| **Activations** | ReLU, softmax | ReLU in MLPs; **softmax** on expert gates |
-| **Forward pass** | Compute ŷ from X | `RAMTModel.forward` |
-| **Backpropagation** | Chain rule for gradients | `loss.backward()` in training |
-| **Optimizers** | AdamW (default in RAMT train) | Weight decay for regularization |
-| **Loss** | MSE + directional penalty | `CombinedLoss` |
-| **Transformer** | Self-attention over sequence | `ExpertTransformer` uses `nn.TransformerEncoder` |
-| **LSTM** | Recurrent baseline | `baseline_lstm.py` |
-| **Dropout** | Random unit drops | Encoders, MoE, positional dropout |
-| **Layer normalization** | Stabilize activations | Throughout encoder/MoE |
-| **Embeddings** | Discrete → vector | **Regime** embedding; **positional** embedding |
-| **Attention** | Weighted aggregation over time | Transformer encoder in each expert |
-| **MoE** | Multiple experts + router | `MixtureOfExperts` + `GatingNetwork` |
-
-**Transfer learning** is **planned** as cross-market transfer in project docs; the current training script is **per-ticker** walk-forward (verify `train.py` for any multi-ticker joint training).
-
----
-
-## 10. Model selection reasoning
-
-| Model | Status | Rationale |
-|-------|--------|-----------|
-| **XGBoost** | Implemented | Strong **tabular** baseline, fast, interpretable feature importance. |
-| **LSTM** | Implemented | Classic **sequence** baseline without attention/MoE complexity. |
-| **RAMT** | Implemented | Tests hypothesis: **structured multimodal fusion** + **regime routing** helps vs single trunk. |
-| **Pure ARIMA / linear** | Not emphasized | Baseline gap for nonlinear multivariate setup. |
-| **Single transformer** | Subsumed | Experts **are** transformers; MoE adds **capacity** without one giant model. |
-
-**Tradeoffs:** RAMT has **more parameters** and **longer train** per fold than XGBoost; **interpretability** comes from **gates** and **regimes** vs tree **feature importance**. Speed vs accuracy is **tunable** (embed dim, layers, experts).
-
----
-
-## 11. Training process (RAMT)
-
-Configured in `models/ramt/train.py` (subject to change in code):
-
-| Item | Typical value | Purpose |
-|------|----------------|--------|
-| **Epochs** | Up to 50 | Enough to converge with early stopping |
-| **Batch size** | 32 | Standard GPU/CPU balance |
-| **Learning rate** | 1e-3 | AdamW default scale |
-| **Weight decay** | 1e-4 | L2 regularization |
-| **Scheduler** | CosineAnnealingWarmRestarts | Escape local minima |
-| **Early stopping** | Patience 10 on **val loss** | Reduce overfit |
-| **Gradient clip** | 1.0 | Stability with transformers |
-| **Hardware** | CPU or CUDA if available | `DEVICE = cuda if available` |
-| **Checkpoints** | Directory `checkpoints/` created; **best weights per fold** held in memory | Full walk-forward retrain each fold by default |
-| **Experiment tracking** | Console + CSV | Add W&B/MLflow if needed |
-
-**Training time** depends on CPU/GPU, number of folds, and ticker length—not fixed in README.
-
----
-
-## 12. Evaluation & results
-
-### Metrics
-
-| Metric | Meaning | Why it matters |
-|--------|---------|----------------|
-| **RMSE / MAE** | Error magnitude | Standard regression fit |
-| **DA%** | % correct **sign** | Directional trading relevance |
-| **Sharpe** (proxy) | Risk-adjusted return of simple strategy using **predictions as sizing** | Sanity check beyond raw error |
-| **MaxDD / Calmar / Profit Factor** | Risk and payoff asymmetry | From `compute_metrics` in `train.py` |
-
-**Confusion matrix:** Not primary for **regression**; direction could be turned into binary classification for extra analysis (not automated in `evaluate.py`).
-
-### Published baseline snapshot (XGBoost, walk-forward)
-
-Illustrative numbers from the project README history (re-run after data refresh):
-
-| Ticker | RMSE | MAE | DA% | Sharpe |
-|--------|------|-----|-----|--------|
-| JPM | 0.0194 | 0.0127 | 52.13 | 0.52 |
-| RELIANCE.NS | 0.0180 | 0.0121 | 52.25 | 0.54 |
-| TCS.NS | 0.0151 | 0.0106 | 53.44 | 0.82 |
-| HDFCBANK.NS | 0.0165 | 0.0111 | 51.52 | 0.04 |
-| EPIGRAL.NS | 0.0243 | 0.0166 | 51.32 | -0.56 |
-| **Average** | **0.0187** | **0.0126** | **52.13** | **0.27** |
-
-**RAMT** results are written to `results/ramt_predictions.csv` when running `models/ramt/train.py`; compare against baselines on the **same walk-forward philosophy**.
-
-**Interpretation:** ~**52% directional accuracy** is only slightly above coin flip—**realistic** for daily returns. The project demonstrates **rigorous methodology** more than guaranteed alpha.
-
----
-
-## 13. Folder structure
-
-```
-regime-adaptive-transformer/
-├── data/
-│   ├── download.py           # Download OHLCV + benchmarks → data/raw/
-│   ├── raw/                  # Raw CSVs (gitignored)
-│   └── processed/            # Engineered features per ticker (gitignored)
-├── features/
-│   └── feature_engineering.py  # HMM, technicals, correlation → processed/
-├── eda/
-│   ├── eda.ipynb             # Exploration
-│   └── plots/                # Figures / summary exports
-├── models/
-│   ├── baseline_xgboost.py   # Walk-forward XGBoost
-│   ├── baseline_lstm.py      # Walk-forward LSTM
-│   └── ramt/
-│       ├── dataset.py        # Column defs, RAMTDataModule, sequences
-│       ├── encoder.py        # Multimodal + regime encoders
-│       ├── moe.py            # Positional encoding, experts, gating, MoE
-│       ├── model.py          # Full RAMTModel
-│       ├── losses.py         # MSE + directional
-│       └── train_ranking.py  # Monthly ranking training + CSV export
-├── FEATURES_AND_REGIMES.md   # Monthly target/features + HMM regime notes
-├── results/                  # Predictions & metric tables (gitignored CSVs)
-├── checkpoints/              # Saved weights (optional; .gitkeep pattern in .gitignore)
-├── evaluate.py               # Summarize baseline predictions CSV
-├── requirements.txt
-├── README.md                 # This file (project entry point)
-├── docs/                     # (currently empty / optional)
-└── Phase1_report.tex / .pdf  # Academic reporting artifacts
-```
-
----
-
-## 14. Installation guide
-
-### Prerequisites
-
-- **Python 3.10+** recommended (project uses modern typing; venv may use 3.14 per environment).  
-- **Git**  
-- Optional: **CUDA** for faster PyTorch training
-
-### Steps
-
-After cloning this repository from your Git hosting provider:
-
-```bash
-cd regime-adaptive-transformer
-
-python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-
-pip install -r requirements.txt
-```
-
-### Data
-
-```bash
-python data/download.py
-python features/feature_engineering.py
-```
-
-Processed CSVs appear under `data/processed/`. **No `.env` file is required** for the default Yahoo pipeline.
-
----
-
-## 15. Usage guide
-
-### Baselines
-
-```bash
-# XGBoost walk-forward; writes predictions under results/
-python models/baseline_xgboost.py
-
-python evaluate.py   # aggregates results/xgboost_predictions.csv if present
-```
-
-```bash
-python models/baseline_lstm.py
-```
-
-### RAMT (full walk-forward)
-
-```bash
-python -m models.ramt.train
-# or
-python models/ramt/train.py
-```
-
-Outputs: **`results/ramt_predictions.csv`**, console metric table.
-
-### Monthly ranking (NIFTY-50-style, combined training)
-
-```bash
-python -m models.ramt.train_ranking
-```
-
-Outputs: **`results/ranking_predictions.csv`** (if the processed CSVs contain `Monthly_Alpha` and are present for many tickers).
-
-### Dashboard (optional)
-
-There is a Streamlit dashboard under `dashboard/app.py` that visualizes predictions and regimes. It currently expects:
-
-- `data/processed/{TICKER}_features.csv`
-- one or more of: `results/xgboost_predictions.csv`, `results/lstm_predictions.csv`, `results/ramt_predictions.csv`
-- optional: `results/monthly_rankings.csv` for the monthly portfolio view (may not exist yet)
-
-Run:
-
-```bash
-./run_dashboard.sh
-```
-
-### Module tests (sanity checks)
-
-```bash
-python -m models.ramt.dataset
-python -m models.ramt.encoder
-python -m models.ramt.moe
-python -m models.ramt.model
-```
-
-### API / UI
-
-- **None** in-repo. Batch inference is via **Python scripts** and **saved CSVs**.
-
-### Retraining on new data
-
-1. Refresh raw data (`download.py`).  
-2. Rebuild features (`feature_engineering.py`).  
-3. Re-run baselines and/or `train.py`.
-
----
-
-## 16. Deployment, scaling & operations
-
-| Aspect | Current state | Production-oriented path |
-|--------|----------------|---------------------------|
-| **Deployment** | Research scripts | Export **TorchScript** or **ONNX**; wrap in **FastAPI** for internal batch scoring |
-| **Containerization** | Not in-repo | Add `Dockerfile` (Python + CUDA optional), pin `requirements.txt` |
-| **Cloud** | Local | S3 for data, SageMaker/Vertex for training |
-| **CI/CD** | Not configured | GitHub Actions: lint, unit tests, smoke `python -m models.ramt.model` |
-| **Scaling inference** | N/A | **Batch** job per universe; **streaming** needs online feature pipeline |
-| **Monitoring** | Manual CSV | Track **prediction drift**, **regime distribution**, **Sharpe** in production |
-
----
-
-## 17. Challenges faced
-
-| Challenge | Mitigation |
-|-----------|------------|
-| **Non-stationarity** | Walk-forward, regime features, regularization |
-| **Leakage** | Scaler fit on train only per fold |
-| **Volatile small caps** | EPIGRAL shows weaker metrics—documented honestly |
-| **Transformer stability** | Pre-norm encoder, grad clip, dropout |
-| **Class imbalance (regression)** | Directional loss + finance metrics |
-
----
-
-## 18. Future improvements
-
-- **Unified experiment tracking** (W&B, MLflow).  
-- **Hyperparameter search** (Optuna) with walk-forward CV.  
-- **Attention visualization** and **gate analysis** dashboards.  
-- **Cross-market transfer** training (multi-ticker joint or pretrain/finetune).  
-- **Production API** + **Docker** + **scheduled retraining**.  
-- **Explainability** (SHAP on baselines; gate attribution for RAMT).  
-- **License file** and **contributing guidelines** for open-source release.
-
----
-
-## 19. Resume / recruiter section
-
-**Why this project stands out**
-
-- Demonstrates **end-to-end ML engineering**: data acquisition, **feature engineering with HMM**, **time-series validation that is not naive k-fold**, **multiple model families**, and **deep learning architecture design** (multimodal encoders, transformers, MoE).  
-- Shows awareness of **finance-specific pitfalls** (leakage, direction vs magnitude, Sharpe).  
-- **Code organization** matches how research teams structure repos (modules, scripts, docs).
-
-**Skills demonstrated**
-
-- Python, PyTorch, scikit-learn, XGBoost, pandas  
-- **Time-series ML**, **walk-forward validation**, **metrics** beyond accuracy  
-- **Transformer architecture**, **MoE**, **embeddings**, **regularization**  
-- Technical writing (**README**, workflow, architecture docs)
-
-**Business relevance**
-
-- Quantitative finance and **model risk** contexts value **transparent methodology** and **honest metrics** over overclaimed accuracy.
-
----
-
-## 20. Contributing & license
-
-### Contributing
-
-1. Fork the repository.  
-2. Create a branch for your change.  
-3. Keep commits focused; match existing style.  
-4. Run module self-tests after changes to `models/ramt/*`.  
-5. Open a pull request with a clear description of motivation and validation.
-
-### License
-
-No `LICENSE` file is present in the repository as of this writing. Before public distribution or reuse, **add an explicit open-source license** (e.g. **MIT** for permissive academic use) and ensure **data terms** from Yahoo/vendors are respected.
-
----
-
-## Team & institution
-
-| Name | Role |
-|------|------|
-| Vivek (230119) | Literature review, LaTeX report, theory |
-| Shivansh Gupta (230054) | Data pipeline, feature engineering, models |
-
-**Institution:** B.Tech Computer Science and Artificial Intelligence, Rishihood University, Sonipat, India.
-
----
-
-## Feature groups (reference)
-
-| Group | Examples | Purpose |
-|-------|----------|---------|
-| Lagged returns | Return_Lag_1 … 20 | Price memory |
-| Volatility | Realized vol, Garman–Klass, vol ratio | Risk regime |
-| Technical | RSI, MACD, Bollinger | Short-horizon positioning |
-| Momentum | Momentum_5/20/60, ROC_10 | Trend |
-| Volume | Volume_MA_Ratio, Volume_Log | Participation |
-| HMM | HMM_Regime | Latent state |
-| Cross-asset | Rolling_Corr_Index | Benchmark context |
-
----
-
-*This README describes the repository as implemented; scripts and hyperparameters may evolve—prefer reading source files for authoritative behavior.*
-
-**Last updated:** 2026-04-16
+I pulled prices and indices with `yfinance`, stored panels with `pyarrow`, leaned on `scikit-learn` and LightGBM for baselines, and built the RAMT prototype in PyTorch. No sponsor, no cloud credit fairy tale, just those libraries and a lot of CPU hours.
