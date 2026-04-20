@@ -25,6 +25,10 @@ from features.feature_engineering import _safe_stem_from_ticker  # noqa: E402
 from features.sectors import get_sector  # noqa: E402
 
 BACKTEST_CSV = ROOT / "results" / "final_strategy" / "backtest_results.csv"
+WEEKLY_BT_CSV = ROOT / "results" / "final_strategy" / "backtest_results_weekly_2023_2026.csv"
+WEEKLY_RET5D_BT_CSV = (
+    ROOT / "results" / "final_strategy" / "backtest_results_weekly_ret5d_2023_2026.csv"
+)
 NIFTY_PARQUET = ROOT / "data" / "raw" / "_NSEI.parquet"
 PROCESSED_DIR = ROOT / "data" / "processed"
 
@@ -110,6 +114,48 @@ st.set_page_config(
 _inject_theme_css()
 
 
+def compute_metrics_with_windows_per_year(
+    bt_path: str | Path,
+    *,
+    windows_per_year: float,
+    capital: float = 100_000,
+) -> dict[str, Any]:
+    """
+    Compute the same metrics as `compute_metrics`, but with explicit Sharpe annualization.
+
+    This is used for *separate experiments* (e.g. weekly) without changing the dashboard's
+    historical monthly assumptions for the production strategy.
+    """
+    bt = pd.read_csv(bt_path, parse_dates=["date"])
+    r = bt["portfolio_return"].dropna()
+    nav = bt["portfolio_value"].values.astype(float)
+    start_ts = bt["date"].iloc[0]
+    end_ts = bt["date"].iloc[-1]
+    span_years = (end_ts - start_ts).days / 365.25
+
+    wpy = float(windows_per_year)
+    sharpe_net = float(r.mean() / r.std() * np.sqrt(wpy)) if r.std() > 0 else 0.0
+
+    total_ret = nav[-1] / capital - 1.0
+    cagr = (1 + total_ret) ** (1 / span_years) - 1 if span_years > 0 else 0.0
+
+    peak = np.maximum.accumulate(nav)
+    max_dd = float(((nav - peak) / peak).min())
+
+    win_rate = float((r > 0).mean())
+
+    return {
+        "sharpe_net": sharpe_net,
+        "cagr": float(cagr),
+        "max_dd": max_dd,
+        "win_rate": win_rate,
+        "total_return": float(total_ret),
+        "final_nav": float(nav[-1]),
+        "n_windows": len(bt),
+        "span_years": float(span_years),
+    }
+
+
 def compute_metrics(bt_path: str | Path, capital: float = 100_000) -> dict[str, Any]:
     bt = pd.read_csv(bt_path, parse_dates=["date"])
     r = bt["portfolio_return"].dropna()
@@ -118,6 +164,7 @@ def compute_metrics(bt_path: str | Path, capital: float = 100_000) -> dict[str, 
     end_ts = bt["date"].iloc[-1]
     span_years = (end_ts - start_ts).days / 365.25
 
+    # Historical dashboard assumption: these backtests are monthly-ish windows.
     sharpe_net = float(r.mean() / r.std() * np.sqrt(12)) if r.std() > 0 else 0.0
 
     total_ret = nav[-1] / capital - 1.0
@@ -728,8 +775,14 @@ def render_momentum_strategy_tabs(
     """Original dashboard: Strategy Performance / Benchmarks / Positions / Research notes."""
     nifty_win = nifty_inter_rebalance_win_rate(bt, nifty_raw)
 
-    tab_perf, tab_bench, tab_pos, tab_notes = st.tabs(
-        ["Strategy Performance", "Strategy vs Benchmarks", "Positions", "Research notes"]
+    tab_perf, tab_bench, tab_weekly, tab_pos, tab_notes = st.tabs(
+        [
+            "Strategy Performance",
+            "Strategy vs Benchmarks",
+            "Weekly experiments",
+            "Positions",
+            "Research notes",
+        ]
     )
 
     with tab_perf:
@@ -852,6 +905,16 @@ def render_momentum_strategy_tabs(
         st.subheader("CAGR, drawdown, Sharpe, win rate")
         ramt_m = optional_metrics_from_csv(ARCHIVE_RAMT_BACKTEST)
         mom_ns_m = optional_metrics_from_csv(ARCHIVE_MOM_NO_SECTOR)
+        weekly_m = (
+            compute_metrics_with_windows_per_year(WEEKLY_BT_CSV, windows_per_year=52)
+            if WEEKLY_BT_CSV.is_file()
+            else None
+        )
+        weekly_ret5d_m = (
+            compute_metrics_with_windows_per_year(WEEKLY_RET5D_BT_CSV, windows_per_year=52)
+            if WEEKLY_RET5D_BT_CSV.is_file()
+            else None
+        )
 
         rows: list[dict[str, str]] = [
             {
@@ -882,6 +945,26 @@ def render_momentum_strategy_tabs(
                     "Win rate": f"{100 * mom_ns_m['win_rate']:.0f}%",
                 }
             )
+        if weekly_m:
+            rows.append(
+                {
+                    "Strategy": "Momentum + regime + sector (weekly, 2023–2026)",
+                    "CAGR": f"{100 * weekly_m['cagr']:.1f}%",
+                    "Max DD": f"{100 * weekly_m['max_dd']:.1f}%",
+                    "Sharpe": f"{weekly_m['sharpe_net']:.2f}",
+                    "Win rate": f"{100 * weekly_m['win_rate']:.0f}%",
+                }
+            )
+        if weekly_ret5d_m:
+            rows.append(
+                {
+                    "Strategy": "Momentum + regime + sector (weekly Ret_5d, 2023–2026)",
+                    "CAGR": f"{100 * weekly_ret5d_m['cagr']:.1f}%",
+                    "Max DD": f"{100 * weekly_ret5d_m['max_dd']:.1f}%",
+                    "Sharpe": f"{weekly_ret5d_m['sharpe_net']:.2f}",
+                    "Win rate": f"{100 * weekly_ret5d_m['win_rate']:.0f}%",
+                }
+            )
         rows.append(
             {
                 "Strategy": "Momentum + regime + sector (current)",
@@ -897,7 +980,9 @@ def render_momentum_strategy_tabs(
         st.caption(
             "NIFTY metrics are computed from `data/raw/_NSEI.parquet` over the same "
             "calendar span as the strategy. Archived rows appear only if the corresponding "
-            "CSV exists under `results/archive/`."
+            "CSV exists under `results/archive/`. Weekly experiment row appears if "
+            f"`{WEEKLY_BT_CSV.relative_to(ROOT)}` exists. Weekly Ret_5d row appears if "
+            f"`{WEEKLY_RET5D_BT_CSV.relative_to(ROOT)}` exists."
         )
 
         st.subheader("Monthly returns heatmap (rebalance months)")
@@ -951,6 +1036,104 @@ def render_momentum_strategy_tabs(
             plot_bgcolor="#0f172a",
         )
         st.plotly_chart(fig_dd, width="stretch")
+
+    with tab_weekly:
+        st.subheader("Weekly experiments")
+        st.caption(
+            "Weekly backtests use the same risk + friction rules as the production strategy, "
+            "but on a weekly rebalance grid. Each sub-tab mirrors the production layout: "
+            "headline metrics → equity curve."
+        )
+
+        def _plot_weekly_equity(bt_path: Path, label: str, color: str) -> None:
+            if not bt_path.is_file():
+                st.info(f"Missing `{bt_path.relative_to(ROOT)}`.")
+                return
+            try:
+                wbt = load_backtest_csv(str(bt_path))
+                w_metrics = compute_metrics_with_windows_per_year(bt_path, windows_per_year=52)
+                w_bench = compute_nifty_benchmark(
+                    NIFTY_PARQUET, wbt["date"].iloc[0], wbt["date"].iloc[-1]
+                )
+
+                st.subheader(f"Headline metrics (from `{bt_path.name}`)")
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    st.metric(
+                        "Net Sharpe",
+                        f"{w_metrics['sharpe_net']:.2f}",
+                        delta=f"{w_metrics['sharpe_net'] - w_bench['sharpe']:.2f} vs NIFTY",
+                        help="Weekly windows annualized as mean/std × √52",
+                    )
+                with c2:
+                    st.metric(
+                        "CAGR",
+                        f"{100 * w_metrics['cagr']:.1f}%",
+                        delta=f"{100 * (w_metrics['cagr'] - w_bench['cagr']):.1f} pp vs NIFTY",
+                    )
+                with c3:
+                    st.metric(
+                        "Max drawdown",
+                        f"{100 * w_metrics['max_dd']:.1f}%",
+                        delta=f"{100 * (w_metrics['max_dd'] - w_bench['max_dd']):.1f} pp vs NIFTY",
+                    )
+                with c4:
+                    # Keep consistent with production: NIFTY win-rate computed on inter-rebalance periods.
+                    w_nifty_win = nifty_inter_rebalance_win_rate(wbt, nifty_raw)
+                    st.metric(
+                        "Win rate",
+                        f"{100 * w_metrics['win_rate']:.0f}%",
+                        delta=f"{100 * (w_metrics['win_rate'] - w_nifty_win):.0f} pp vs NIFTY",
+                    )
+
+                st.subheader("Equity curve")
+                nav_df_w = nifty_nav_at_rebalance_dates(wbt, nifty_raw)
+                fig_w = go.Figure()
+                fig_w.add_trace(
+                    go.Scatter(
+                        x=wbt["date"],
+                        y=wbt["portfolio_value"],
+                        name=f"{label} NAV",
+                        line=dict(color=color, width=2),
+                    )
+                )
+                fig_w.add_trace(
+                    go.Scatter(
+                        x=nav_df_w["date"],
+                        y=nav_df_w["nifty_nav"],
+                        name="NIFTY buy-and-hold (aligned dates)",
+                        line=dict(color="#94a3b8", width=2, dash="dot"),
+                    )
+                )
+                add_regime_vrects(fig_w, wbt)
+                fig_w.update_layout(
+                    title=f"{label} — Portfolio vs NIFTY (₹100,000 start) — background = regime at rebalance",
+                    xaxis_title="Date",
+                    yaxis_title="NAV (₹)",
+                    legend=dict(
+                        orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1
+                    ),
+                    margin=dict(t=60),
+                    **_plotly_dark(),
+                )
+                fig_w.update_yaxes(tickformat=",.0f")
+                st.plotly_chart(fig_w, width="stretch")
+            except Exception as e:
+                st.warning(f"Weekly equity plot failed for `{bt_path.name}`: {e}")
+
+        w1, w2 = st.tabs(["Weekly — Ret_21d signal", "Weekly — Ret_5d signal"])
+        with w1:
+            _plot_weekly_equity(
+                WEEKLY_BT_CSV,
+                "Momentum + regime + sector (weekly Ret_21d signal)",
+                "#38bdf8",
+            )
+        with w2:
+            _plot_weekly_equity(
+                WEEKLY_RET5D_BT_CSV,
+                "Momentum + regime + sector (weekly Ret_5d signal)",
+                "#a78bfa",
+            )
 
     with tab_pos:
         dates = pd.to_datetime(bt["date"]).tolist()
