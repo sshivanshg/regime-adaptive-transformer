@@ -3,8 +3,6 @@
 
 \usepackage{cite}
 \usepackage{amsmath,amssymb,amsfonts}
-\usepackage{algorithmic}
-\usepackage{textcomp}
 \usepackage{xcolor}
 \usepackage{booktabs}
 \usepackage{url}
@@ -57,7 +55,17 @@ Cross-sectional momentum has been studied since Jegadeesh and Titman \cite{jegad
 
 Hidden Markov Models for regime detection in financial time series were introduced by Hamilton \cite{hamilton1989}. Guidolin and Timmermann \cite{guidolin2007} used HMM-derived regimes for asset allocation. In Indian markets, such regime-based approaches are less studied but structurally similar.
 
-Transformer architectures have been applied to financial time series in work such as the Temporal Fusion Transformer \cite{lim2021} and various attention-based forecasting models. Applications to cross-sectional equity selection are less common, and reported gains over simpler factor-based baselines are modest.
+Before the Phase 2 implementation, two more ambitious research directions were considered. The first was a cross-modal news-price framework that combines large language models, Transformers, and Soft Actor-Critic reinforcement learning for volatility-adaptive trading \cite{alignnews2026}. Its main idea is that financial news and prices carry complementary information: news can reveal event and sentiment information before it is fully reflected in price, while price captures the market's realised reaction. The paper uses language-model embeddings, price encoders, cross-modal attention, and a reinforcement-learning trading policy. This motivated the initial idea of using richer market context, but the present project did not implement news collection, LLM sentiment extraction, price-to-language reprogramming, or SAC because reliable stock-level Indian news alignment was outside the available data scope.
+
+The second Phase 1 reference was the Hybrid Transformer Graph Neural Network for equity correlation forecasting \cite{fanshawe2026}. That work uses a Transformer to encode each stock's recent temporal features and a graph attention network to model cross-stock relationships, predicting future pairwise correlations using Fisher-z residual targets. It is relevant because portfolio risk depends not only on the expected return of each stock but also on how stocks co-move. This project adopts the stock-level temporal Transformer idea and uses sector caps as a simple risk-control proxy, but it does not implement graph construction, graph neural networks, correlation forecasting, or SPONGE-style clustering. The final task is cross-sectional alpha ranking rather than pairwise correlation prediction.
+
+The Transformer architecture introduced by Vaswani et al. \cite{vaswani2017} replaced recurrence with scaled dot-product self-attention, allowing every timestep in a sequence to attend to every other timestep. This is useful for financial windows because a model may need to compare recent momentum, volatility shocks, and older reversal patterns inside the same lookback period. RAMT uses this idea through a Transformer encoder over 30-day feature windows.
+
+Several time-series Transformer variants informed the design and future-work analysis. Temporal Fusion Transformer (TFT) \cite{lim2021} is especially relevant because it handles heterogeneous time-series inputs, static covariates, gating, and interpretable attention. RAMT borrows the spirit of heterogeneous feature fusion by separating price, technical, volume, macro, ticker, and regime inputs before combining them. Informer \cite{zhou2021informer} reduces the cost of attention for very long sequences using sparse attention, but it is less central here because RAMT uses only 30-day windows. Autoformer \cite{wu2021autoformer} introduces decomposition and auto-correlation mechanisms for long-term forecasting; its trend-seasonal decomposition idea is relevant future work for separating momentum from reversal. PatchTST \cite{nie2023patchtst} represents time series as patches rather than individual timesteps, which could help this project reduce one-day noise by turning daily observations into weekly or multi-day tokens.
+
+Learning-to-rank methods are also directly relevant. RankNet \cite{burges2005ranknet} introduced neural pairwise ranking, while later listwise approaches such as ListNet \cite{cao2007listnet} optimise ranking distributions instead of independent scalar errors. This matters because the portfolio does not require perfectly calibrated return forecasts for all stocks; it requires the top-ranked stocks on each rebalance date to be better than the rest. RAMT therefore uses a pairwise \texttt{TournamentRankingLoss}, which is closer to the portfolio objective than plain MSE regression.
+
+Finance-specific Transformer models provide additional context. MASTER \cite{li2024master} uses market-guided attention for stock prediction, showing that stock-level forecasts can benefit from market-wide context and cross-stock information. StockFormer \cite{gao2023stockformer} explores Transformer-based trading representations and connects predictive features to trading decisions. These works support the direction of adding market awareness and asset-relation modelling, but the present project deliberately keeps prediction and portfolio construction separate: RAMT or momentum produces a ranking score, and a rule-based backtest applies sector caps, HMM sizing, and transaction costs.
 
 This project situates itself as an empirical test in this last area: does a purpose-built transformer architecture improve on a basic momentum ranking in Indian equities? The rest of the paper answers that question.
 
@@ -112,6 +120,65 @@ The Regime-Adaptive Multimodal Transformer (RAMT) was designed to process 30-day
 \end{itemize}
 
 The rationale for each component was plausible: regime enters the model at multiple points (encoder, cross-attention, gating) rather than being just another input feature. The MoE provides capacity specialisation. The ranking loss targets relative ordering rather than absolute return magnitude, which matches how the strategy will use the predictions.
+
+\subsection{Model Mechanics}
+
+RAMT uses scaled dot-product attention as the basic sequence operation. Given query, key, and value matrices $Q$, $K$, and $V$, attention is computed as:
+
+\[
+\operatorname{Attention}(Q,K,V)
+=
+\operatorname{softmax}\left(\frac{QK^\top}{\sqrt{d_k}}\right)V
+\]
+
+The term $QK^\top$ measures similarity between timesteps, while the division by $\sqrt{d_k}$ prevents dot products from becoming too large as the hidden dimension grows. Without this scaling, the softmax can become overly peaked early in training, causing unstable gradients. In this project, self-attention allows the model to compare all days inside the 30-day window, rather than processing the sequence strictly left-to-right as an RNN would.
+
+The regime cross-attention block uses the HMM regime embedding as a query and the encoded 30-day feature sequence as keys and values:
+
+\[
+z_{\text{regime}}
+=
+\operatorname{Attention}(q_r, K_x, V_x)
+\]
+
+where $q_r$ is the embedding of the current regime and $K_x,V_x$ are projections of the encoded feature sequence. This design was chosen instead of simply appending the regime label as another scalar feature because a scalar regime feature would give the model only a static indicator. Cross-attention lets the regime actively reweight the sequence. For example, in a high-volatility regime, the model can learn to pay more attention to recent volatility shocks or short-term reversal signals; in a bull regime, it can learn to attend more strongly to sustained momentum. Thus the regime is used as context for deciding which timesteps matter, not merely as another input column.
+
+The HMM regime model assumes an unobserved state variable $s_t \in \{1,2,3\}$ that evolves according to a Markov transition matrix:
+
+\[
+P(s_t=j \mid s_{t-1}=i) = A_{ij}
+\]
+
+Observed market features $x_t=[\text{Ret\_1d}, \text{Realized\_Vol\_20}]$ are modelled as Gaussian emissions conditional on the hidden state:
+
+\[
+p(x_t \mid s_t=k) =
+\mathcal{N}(x_t;\mu_k,\Sigma_k)
+\]
+
+The likelihood of an observed sequence is therefore:
+
+\[
+p(x_{1:T}) =
+\sum_{s_{1:T}}
+\pi_{s_1}p(x_1\mid s_1)
+\prod_{t=2}^{T} A_{s_{t-1},s_t}p(x_t\mid s_t)
+\]
+
+This is useful for the project because it gives a probabilistic way to infer whether the current market is behaving like a bull, bear, or high-volatility state using only past return and volatility information.
+
+The ranking objective is based on pairwise ordering within the same rebalance date. For two stocks $i$ and $j$ where the realised alpha satisfies $y_i > y_j$, the model should predict $p_i > p_j$. The tournament ranking loss is:
+
+\[
+\mathcal{L}_{rank}
+=
+\frac{1}{|\mathcal{P}|}
+\sum_{(i,j)\in \mathcal{P}}
+\max\left(0, m - (p_i-p_j)\right)
+\cdot |y_i-y_j|
+\]
+
+where $\mathcal{P}$ is the set of comparable stock pairs on the same date and $m$ is the margin. The magnitude term $|y_i-y_j|$ gives more weight to pairs where the realised alpha gap is economically meaningful. This matches the trading objective better than plain MSE because the portfolio only needs the top-ranked names to be ordered correctly.
 
 \subsection{Training Setup}
 
@@ -363,8 +430,17 @@ The broader observation from this work is that for a universe and horizon where 
 \bibitem{asness2013} C. S. Asness, T. J. Moskowitz, and L. H. Pedersen, ``Value and momentum everywhere,'' \textit{Journal of Finance}, vol. 68, no. 3, pp. 929--985, 2013.
 \bibitem{hamilton1989} J. D. Hamilton, ``A new approach to the economic analysis of nonstationary time series and the business cycle,'' \textit{Econometrica}, vol. 57, no. 2, pp. 357--384, 1989.
 \bibitem{guidolin2007} M. Guidolin and A. Timmermann, ``Asset allocation under multivariate regime switching,'' \textit{Journal of Economic Dynamics and Control}, vol. 31, no. 11, pp. 3503--3544, 2007.
+\bibitem{alignnews2026} Anonymous Authors, ``Aligning news and prices: A cross-modal LLM-enhanced Transformer DRL framework for volatility-adaptive stock trading,'' under review, 2026.
+\bibitem{fanshawe2026} J. Fanshawe, R. Masih, and A. Cameron, ``Forecasting equity correlations with hybrid Transformer graph neural network,'' arXiv:2601.04602, 2026.
 \bibitem{lim2021} B. Lim, S. \"O. Ar\i k, N. Loeff, and T. Pfister, ``Temporal Fusion Transformers for interpretable multi-horizon time series forecasting,'' \textit{International Journal of Forecasting}, vol. 37, no. 4, pp. 1748--1764, 2021.
 \bibitem{vaswani2017} A. Vaswani et al., ``Attention is all you need,'' in \textit{NeurIPS}, 2017.
+\bibitem{zhou2021informer} H. Zhou, S. Zhang, J. Peng, S. Zhang, J. Li, H. Xiong, and W. Zhang, ``Informer: Beyond efficient Transformer for long sequence time-series forecasting,'' in \textit{AAAI}, 2021.
+\bibitem{wu2021autoformer} H. Wu, J. Xu, J. Wang, and M. Long, ``Autoformer: Decomposition Transformers with auto-correlation for long-term series forecasting,'' in \textit{NeurIPS}, 2021.
+\bibitem{nie2023patchtst} Y. Nie, N. H. Nguyen, P. Sinthong, and J. Kalagnanam, ``A time series is worth 64 words: Long-term forecasting with Transformers,'' in \textit{ICLR}, 2023.
+\bibitem{burges2005ranknet} C. Burges, T. Shaked, E. Renshaw, A. Lazier, M. Deeds, N. Hamilton, and G. Hullender, ``Learning to rank using gradient descent,'' in \textit{ICML}, 2005.
+\bibitem{cao2007listnet} Z. Cao, T. Qin, T.-Y. Liu, M.-F. Tsai, and H. Li, ``Learning to rank: From pairwise approach to listwise approach,'' in \textit{ICML}, 2007.
+\bibitem{li2024master} J. Li et al., ``MASTER: Market-guided stock Transformer for stock price forecasting,'' 2024.
+\bibitem{gao2023stockformer} S. Gao, Y. Wang, and X. Yang, ``StockFormer: Learning hybrid trading machines with predictive coding,'' in \textit{IJCAI}, 2023.
 \bibitem{hmmlearn} \texttt{hmmlearn} library, hmmlearn developers. [Online]. Available: \url{https://hmmlearn.readthedocs.io}
 \end{thebibliography}
 
