@@ -230,7 +230,11 @@ class RAMTDataset:
 
         if TARGET_COL in df.columns and df[TARGET_COL].notna().any():
             eff = TARGET_COL
-        elif TARGET_COL == "Sector_Alpha" and "Monthly_Alpha" in df.columns:
+        elif (
+            TARGET_COL == "Sector_Alpha"
+            and "Monthly_Alpha" in df.columns
+            and df["Monthly_Alpha"].notna().any()
+        ):
             warnings.warn(
                 f"{self.ticker}: Sector_Alpha is missing/all-NaN; using Monthly_Alpha.",
                 RuntimeWarning,
@@ -354,7 +358,11 @@ class LazyTickerStore:
             raise ValueError(f"{ticker}: missing feature columns: {missing}")
         if TARGET_COL in df.columns and df[TARGET_COL].notna().any():
             eff_target = TARGET_COL
-        elif TARGET_COL == "Sector_Alpha" and "Monthly_Alpha" in df.columns:
+        elif (
+            TARGET_COL == "Sector_Alpha"
+            and "Monthly_Alpha" in df.columns
+            and df["Monthly_Alpha"].notna().any()
+        ):
             warnings.warn(
                 f"{ticker}: Sector_Alpha is missing/all-NaN; using Monthly_Alpha until you "
                 "re-run features/feature_engineering.py (sector-neutral panel step).",
