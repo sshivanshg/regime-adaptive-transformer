@@ -287,6 +287,7 @@ def train_and_evaluate() -> None:
         model.train()
         running_loss = 0.0
         n_obs = 0
+        batch_num = 0
         for x_b, y_b in train_loader:
             x_b = x_b.to(device)
             y_b = y_b.to(device)
@@ -300,9 +301,14 @@ def train_and_evaluate() -> None:
             bs = int(y_b.shape[0])
             running_loss += float(loss.item()) * bs
             n_obs += bs
+            batch_num += 1
+
+            if batch_num % 50 == 0:
+                batch_avg_loss = running_loss / max(n_obs, 1)
+                print(f"  Epoch {epoch:02d} - batch {batch_num:4d} - running_mse={batch_avg_loss:.6f} (n={n_obs})")
 
         epoch_loss = running_loss / max(n_obs, 1)
-        print(f"Epoch {epoch:02d}/{EPOCHS} - train_mse={epoch_loss:.6f}")
+        print(f"Epoch {epoch:02d}/{EPOCHS} - train_mse={epoch_loss:.6f} (total batches={batch_num})")
 
     model.eval()
     all_pred: list[float] = []
