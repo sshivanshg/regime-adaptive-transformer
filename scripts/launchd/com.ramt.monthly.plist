@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.ramt.monthly</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+      <key>Day</key>
+      <integer>1</integer>
+      <key>Hour</key>
+      <integer>10</integer>
+      <key>Minute</key>
+      <integer>0</integer>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/shivanshgupta/regime-adaptive-transformer</string>
+
+    <key>ProgramArguments</key>
+    <array>
+      <string>/Users/shivanshgupta/regime-adaptive-transformer/.venv/bin/python</string>
+      <string>/Users/shivanshgupta/regime-adaptive-transformer/scripts/trigger_monthly_run.py</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>RAMT_API_BASE</key>
+      <string>http://127.0.0.1:8000/api</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/shivanshgupta/regime-adaptive-transformer/logs/launchd_monthly.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/shivanshgupta/regime-adaptive-transformer/logs/launchd_monthly.err</string>
+  </dict>
+</plist>
+

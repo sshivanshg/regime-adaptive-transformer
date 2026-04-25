@@ -1,0 +1,7 @@
+{
+  "equities_requested": 200,
+  "equities_downloaded_ok": 200,
+  "equities_failed": 0,
+  "failed_equity_tickers": [],
+  "failed_equity_errors": {}
+}

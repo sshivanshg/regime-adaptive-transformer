@@ -12,6 +12,11 @@ data/raw/*.csv
 data/processed/*.csv
 # results/ outputs are versioned for dashboards & reproducibility (CSV/JSON; keep sizes reasonable)
 
+# Local app state
+logs/
+app.db
+results/runs/
+
 # Models
 checkpoints/*.pt
 checkpoints/*.joblib
