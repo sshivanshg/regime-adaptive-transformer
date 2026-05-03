@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+title: "Regime-Adaptive Transformer with Sentiment Gating"
+message: "If you use this project, please cite it using the metadata below."
+type: software
+authors:
+  - family-names: "Vishnoi"
+    given-names: "Vivek"
+repository-code: "https://github.com/example/regime-adaptive-transformer"
+license: "MIT"
+version: "1.0.0"
+date-released: "2026-05-02"
+keywords:
+  - quantitative-finance
+  - transformers
+  - hmm
+  - sentiment-analysis
+  - ablation-study
+abstract: >-
+  A reproducible NIFTY 200 research pipeline combining momentum, HMM regime
+  conditioning, and FinBERT/LoRA sentiment gating with diagnostic ablations.

@@ -1,0 +1,30 @@
+[
+    {
+        "CAGR":-0.2868563353,
+        "Sharpe_Net":-6.3518546074,
+        "Max_Drawdown":-0.5216525225,
+        "Win_Rate":0.0,
+        "Scenario":"Baseline (ML): Momentum + HMM"
+    },
+    {
+        "CAGR":-0.4196481414,
+        "Sharpe_Net":-9810.380416493,
+        "Max_Drawdown":-0.6947412769,
+        "Win_Rate":0.0,
+        "Scenario":"Foundation Only (DL): Chronos-T5 (LoRA)"
+    },
+    {
+        "CAGR":-0.4161107393,
+        "Sharpe_Net":-531.8717514099,
+        "Max_Drawdown":-0.69066875,
+        "Win_Rate":0.0,
+        "Scenario":"Simple Hybrid: Momentum + Chronos (50\/50)"
+    },
+    {
+        "CAGR":-0.2898059119,
+        "Sharpe_Net":-6.2680169477,
+        "Max_Drawdown":-0.5260136451,
+        "Win_Rate":0.0,
+        "Scenario":"Triple-Expert (Proposed): Momentum + Chronos + HMM"
+    }
+]

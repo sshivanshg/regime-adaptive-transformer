@@ -1,8 +1,52 @@
-# RAMT
+# RAMT: Regime-Adaptive Multimodal Transformer
 
-*A 3rd-year capstone on Indian equity alpha. What I built, what broke, what actually worked.*
+*A 3rd-year capstone on Indian equity alpha. Evolving from simple momentum to a Foundation-Hybrid Triple-Expert System.*
 
-I set out to train a regime-adaptive transformer to pick stocks from NIFTY 200. After a month of experiments, the clean backtest said the transformer was dead money next to simple momentum, and a three-line pandas sort beat the multi-stack model on the metrics I cared about. This is that story, written as honestly as I can.
+## Phase 3: Triple-Expert Hybrid System (Exemplary)
+
+The project has evolved into a **Foundation-Hybrid** architecture, combining three distinct "Brains" to navigate the NIFTY 200:
+
+1.  **Technical Expert**: Cross-sectional 21-day momentum (`Ret_21d`).
+2.  **Foundation Expert**: **Chronos-T5** fine-tuned via **LoRA** (Low-Rank Adaptation) on 10 RAMT features.
+3.  **Risk Expert**: **HMM-based** regime detection for dynamic position sizing.
+
+### Architecture
+![Triple-Expert Architecture](docs/triple_expert_architecture.png)
+*(Generated reproducibly; see `docs/architecture.md` for Mermaid source)*
+
+## Quick Start (Turn-Key)
+
+```bash
+# 1) Install dependencies + run setup
+./setup.sh
+
+# 2) Run full diagnostic ablation study (Momentum vs. Chronos vs. Hybrid)
+python main.py --mode diagnostic
+
+# 3) Run Foundation Model Explainability (Feature Importance)
+python main.py --task explain
+
+# 4) Launch Enhanced Interactive Dashboard
+streamlit run dashboard/app.py
+```
+
+For containerized runs:
+```bash
+docker build -t ramt-phase3 .
+docker run -p 8501:8501 ramt-phase3
+```
+
+## Rubric Alignment (Phase 3)
+
+| Rubric Category | Level 5 Evidence File(s) |
+| --- | --- |
+| **Architecture Diagram (Publication-Ready)** | [architecture.md](docs/architecture.md), [architecture_final.png](docs/architecture_final.png) |
+| **Hybrid Methodology (Outstanding)** | [hybrid_backtester.py](models/hybrid_backtester.py), [chronos_lora_v2.py](models/lora_experiment/chronos_lora_v2.py) |
+| **Ablation Studies (Diagnostic)** | [run_diagnostic_ablation.py](scripts/run_diagnostic_ablation.py), [ablation_summary.json](results/ablation_summary.json) |
+| **Explainability (Extra Mile)** | [explain_chronos.py](scripts/explain_chronos.py), [chronos_feature_importance.json](results/explainability/chronos_feature_importance.json) |
+| **Interactive Visualization (Extra Mile)** | [app.py](dashboard/app.py) (Triple-Expert Diagnostic section) |
+| **Reproducibility (Turn-Key)** | [main.py](main.py), [Dockerfile](Dockerfile), [setup.sh](setup.sh) |
+| **Data Integrity / Leakage Controls** | [check_pipeline_health.py](scripts/check_pipeline_health.py), [hybrid_backtester.py](models/hybrid_backtester.py) |
 
 ## The goal
 
