@@ -1,0 +1,20 @@
+SUBMISSION CHECKLIST
+====================
+
+[FAIL] Reproducibility (main.py --task all)
+Master runner failed (exit 1). Output tail:
+
+Traceback (most recent call last):
+  File "/Users/vivekvishnoi/AML/regime-adaptive-transformer/main.py", line 18, in <module>
+    import yaml
+ModuleNotFoundError: No module named 'yaml'
+
+
+[PASS] File Integrity
+All required assets found.
+
+[FAIL] Documentation Headers (.py scan)
+Missing headers in: ['features/__init__.py', 'features/sentiment_integration.py', 'features/sectors.py', 'models/baseline_lstm.py', 'models/permutation_importance.py', 'models/baseline_xgboost.py', 'models/__init__.py', 'models/ablation_engine.py', 'models/inspect_attention.py', 'models/attention_consistency_report.py', 'models/run_final_2024_2026.py', 'dashboard/__init__.py', 'dashboard/market_scraper.py', 'dashboard/market_pulse.py', 'scripts/build_momentum_predictions.py', 'scripts/regenerate_ramt_outputs.py', 'scripts/check_references.py', 'scripts/run_nifty500_annual_hmm_ablation.py', 'scripts/parameter_sensitivity_backtest.py', 'scripts/merge_sentiment_into_features.py', 'scripts/baseline_feature_ic.py', 'scripts/run_weekly_momentum_experiment.py', 'scripts/generate_sentiment_features.py', 'scripts/build_processed_range.py', 'scripts/run_yf_hmm_ablation.py', 'scripts/momentum_predictions_from_features.py', 'scripts/run_weekly_momentum_experiment_ret5d.py', 'scripts/fetch_nifty200.py', 'scripts/hmm_vs_flat_backtest.py', 'data/download.py', 'data/__init__.py', 'models/ramt/__init__.py', 'models/ramt/encoder.py', 'models/ramt/model.py', 'models/ramt/dataset.py', 'models/ramt/train_ranking.py', 'models/ramt/losses.py', 'models/ramt/moe.py', 'models/lora_experiment/__init__.py', 'models/lora_experiment/chronos_lora.py'] ...
+
+[FAIL] Overall Submission Readiness
+NOT READY

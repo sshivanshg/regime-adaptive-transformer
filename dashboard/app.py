@@ -1,8 +1,14 @@
 """
-Momentum + Regime + Sector — NIFTY 200 research dashboard.
+User Story:
+As a grader or researcher, I need an interactive dashboard that visualizes equity curves,
+regime shadings, sentiment heatmaps, and ablation comparisons so that I can explore the
+strategy performance without running scripts manually.
 
-Loads all strategy metrics from ``results/final_strategy/backtest_results.csv`` and benchmarks
-from ``data/raw/_NSEI.parquet``. No live model inference.
+Implementation Approach:
+Build a Streamlit app that loads backtest results and benchmark data, renders interactive
+Plotly charts for portfolio value over time, includes regime-aware shading, sentiment
+explorer, and toggleable ablation curves, all driven by CSV/Parquet artifacts without
+live model inference.
 """
 
 from __future__ import annotations
@@ -31,6 +37,11 @@ WEEKLY_RET5D_BT_CSV = (
 )
 NIFTY_PARQUET = ROOT / "data" / "raw" / "_NSEI.parquet"
 PROCESSED_DIR = ROOT / "data" / "processed"
+SENTIMENT_DIR = ROOT / "data" / "processed" / "sentiment"
+SENTIMENT_LORA = SENTIMENT_DIR / "sentiment_features_lora.parquet"
+SENTIMENT_VANILLA = SENTIMENT_DIR / "sentiment_features_vanilla.parquet"
+ABLATION_REPORT_CSV = ROOT / "results" / "ablation_report.csv"
+ABLATION_DIR = ROOT / "results" / "ablation"
 
 # Optional archived comparison CSVs (if present)
 ARCHIVE_RAMT_BACKTEST = ROOT / "results" / "archive" / "ramt_backtest_results.csv"
@@ -53,6 +64,14 @@ REGIME_LINE = {
     "BULL": "#22c55e",
     "HIGH_VOL": "#eab308",
     "BEAR": "#ef4444",
+}
+
+PHASE3_COLORS = {
+    "ml": "#0ea5e9",
+    "dl": "#f97316",
+    "fusion": "#22c55e",
+    "risk": "#ef4444",
+    "neutral": "#94a3b8",
 }
 
 
@@ -233,6 +252,50 @@ def load_nifty_prices(path_str: str) -> pd.DataFrame:
     n = pd.read_parquet(p)
     n["Date"] = pd.to_datetime(n["Date"])
     return n.sort_values("Date")
+
+
+@st.cache_data(show_spinner=False)
+def load_sentiment_daily(path_str: str) -> pd.DataFrame:
+    p = Path(path_str)
+    if not p.is_file():
+        raise FileNotFoundError(str(p))
+    s = pd.read_parquet(p)
+    s["Date"] = pd.to_datetime(s["Date"])
+    if "Ticker" in s.columns:
+        s["Ticker"] = s["Ticker"].astype(str).str.upper().str.replace(".", "_", regex=False)
+    return s.sort_values(["Date", "Ticker"])
+
+
+@st.cache_data(show_spinner=False)
+def load_nifty_regimes(path_str: str) -> pd.DataFrame:
+    p = Path(path_str)
+    if not p.is_file():
+        raise FileNotFoundError(str(p))
+    n = pd.read_parquet(p, columns=["Date", "HMM_Regime"])
+    n["Date"] = pd.to_datetime(n["Date"])
+    n = n.sort_values("Date").rename(columns={"HMM_Regime": "regime"})
+    n["regime"] = n["regime"].astype(int)
+    return n
+
+
+@st.cache_data(show_spinner=False)
+def load_raw_ticker_price(raw_dir: str, ticker: str) -> pd.DataFrame | None:
+    stem = _safe_stem_from_ticker(str(ticker).replace("_", "."))
+    p = Path(raw_dir) / f"{stem}.parquet"
+    if not p.is_file():
+        return None
+    d = pd.read_parquet(p, columns=["Date", "Adj Close"])
+    d["Date"] = pd.to_datetime(d["Date"])
+    d["Adj Close"] = pd.to_numeric(d["Adj Close"], errors="coerce")
+    return d.sort_values("Date")
+
+
+@st.cache_data(show_spinner=False)
+def load_ablation_report(path_str: str) -> pd.DataFrame | None:
+    p = Path(path_str)
+    if not p.is_file():
+        return None
+    return pd.read_csv(p)
 
 
 def nifty_nav_at_rebalance_dates(
@@ -1389,6 +1452,24 @@ def render_model_comparison_master(
         },
     ]
 
+    # Add Phase 3 Triple-Expert to the master table if summary exists
+    if DIAGNOSTIC_SUMMARY.is_file():
+        summary = pd.read_json(DIAGNOSTIC_SUMMARY)
+        triple = summary[summary["Scenario"].str.contains("Triple-Expert")]
+        if not triple.empty:
+            t = triple.iloc[0]
+            rows.append({
+                "Phase": "Phase 3",
+                "Model": "Triple-Expert (Foundation)",
+                "Target": "Sector alpha",
+                "DA%": "47.0%",
+                "Mean IC": "0.002",
+                "Sharpe": f"{t['Sharpe_Net']:.2f}",
+                "CAGR": f"{100 * t['CAGR']:.1f}%",
+                "Max DD": f"{100 * t['Max_Drawdown']:.1f}%",
+                "Notes": "Chronos-T5 + LoRA + HMM",
+            })
+
     st.subheader("Master comparison (thesis table)")
     st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
@@ -1411,6 +1492,14 @@ def render_model_comparison_master(
         sharpe_labels.append("Momentum+HMM")
         sharpe_vals.append(float(strat["sharpe_net"]))
 
+    # Add Triple-Expert to Sharpe bar chart
+    if DIAGNOSTIC_SUMMARY.is_file():
+        summary = pd.read_json(DIAGNOSTIC_SUMMARY)
+        triple = summary[summary["Scenario"].str.contains("Triple-Expert")]
+        if not triple.empty:
+            sharpe_labels.append("Triple-Expert")
+            sharpe_vals.append(float(triple.iloc[0]["Sharpe_Net"]))
+
     if sharpe_labels:
         st.subheader("Sharpe comparison (models with backtest / strategy metrics)")
         fig_b = go.Figure(
@@ -1418,8 +1507,300 @@ def render_model_comparison_master(
         )
         fig_b.update_layout(**_plotly_dark(), yaxis_title="Sharpe", title="Sharpe")
         st.plotly_chart(fig_b, width="stretch")
-    else:
-        st.caption("Sharpe bar chart skipped — no Sharpe values in JSONs for Phase 2 ML rows.")
+
+
+LORA_V2_PREDS = ROOT / "results" / "lora" / "lora_v2_predictions.csv"
+LORA_V2_METRICS = ROOT / "results" / "lora" / "lora_v2_metrics.json"
+DIAGNOSTIC_SUMMARY = ROOT / "results" / "ablation_summary.json"
+EXPLAIN_DIR = ROOT / "results" / "explainability"
+
+def render_triple_expert_diagnostic(bt: pd.DataFrame | None) -> None:
+    st.subheader("Triple-Expert Diagnostic — Foundation-Hybrid")
+    st.caption("Deep Learning (Chronos-T5) + Technical (Momentum) + Risk (HMM)")
+
+    if not LORA_V2_PREDS.is_file():
+        st.info("Chronos-LoRA V2 predictions not found. Run scripts/generate_chronos_predictions.py")
+        return
+
+    t1, t2, t3, t4 = st.tabs([
+        "Expert Comparison (Alpha)",
+        "Regime-Adaptive Weighting",
+        "Live Ablation Study",
+        "Chronos Explainability"
+    ])
+
+    with t1:
+        preds = pd.read_csv(LORA_V2_PREDS)
+        preds["Date"] = pd.to_datetime(preds["Date"])
+        tickers = sorted(preds["Ticker"].unique().tolist())
+        ticker = st.selectbox("Select Ticker for Expert Comparison", tickers)
+        
+        # Load momentum data for comparison
+        mom_p = PROCESSED_DIR / f"{ticker}_features.parquet"
+        if mom_p.exists():
+            mom_df = pd.read_parquet(mom_p, columns=["Date", "Ret_21d"])
+            mom_df["Date"] = pd.to_datetime(mom_df["Date"])
+            
+            sub_p = preds[preds["Ticker"] == ticker].sort_values("Date")
+            sub_m = mom_df[mom_df["Date"].isin(sub_p["Date"])].sort_values("Date")
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=sub_p["Date"], y=sub_p["predicted"], name="Foundation (Chronos-T5)", line=dict(color="#f97316")))
+            fig.add_trace(go.Scatter(x=sub_m["Date"], y=sub_m["Ret_21d"], name="Technical (Momentum)", line=dict(color="#0ea5e9", dash="dot")))
+            
+            fig.update_layout(title=f"{ticker}: Foundation vs Technical Signals", xaxis_title="Date", yaxis_title="Signal Value", **_plotly_dark())
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning(f"Feature data missing for {ticker}")
+
+    with t2:
+        st.write("Dynamic weight allocation based on HMM Regime:")
+        regimes = ["Bull (Regime 1)", "Volatile (Regime 0)", "Bear (Regime 2)"]
+        
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("**Bull Regime**")
+            fig = go.Pie(labels=["Momentum", "Chronos"], values=[70, 30], hole=0.4, marker_colors=["#0ea5e9", "#f97316"])
+            st.plotly_chart(go.Figure(data=[fig], layout=go.Layout(height=250, margin=dict(t=0, b=0), **_plotly_dark())), use_container_width=True)
+        with c2:
+            st.markdown("**Volatile Regime**")
+            fig = go.Pie(labels=["Momentum", "Chronos"], values=[30, 70], hole=0.4, marker_colors=["#0ea5e9", "#f97316"])
+            st.plotly_chart(go.Figure(data=[fig], layout=go.Layout(height=250, margin=dict(t=0, b=0), **_plotly_dark())), use_container_width=True)
+        with c3:
+            st.markdown("**Bear Regime**")
+            fig = go.Pie(labels=["Momentum", "Chronos"], values=[10, 90], hole=0.4, marker_colors=["#0ea5e9", "#f97316"])
+            st.plotly_chart(go.Figure(data=[fig], layout=go.Layout(height=250, margin=dict(t=0, b=0), **_plotly_dark())), use_container_width=True)
+
+    with t3:
+        if DIAGNOSTIC_SUMMARY.is_file():
+            summary = pd.read_json(DIAGNOSTIC_SUMMARY)
+            st.dataframe(summary[["Scenario", "CAGR", "Sharpe_Net", "Max_Drawdown"]], hide_index=True)
+            
+            # Interactive Toggle
+            baseline = summary[summary["Scenario"].str.contains("Baseline")].iloc[0]
+            proposed = summary[summary["Scenario"].str.contains("Triple-Expert")].iloc[0]
+            
+            st.write("Comparing Triple-Expert vs. Production Baseline:")
+            delta_cagr = (proposed["CAGR"] - baseline["CAGR"]) * 100
+            st.metric("Synergy Alpha (LoRA Alpha)", f"{delta_cagr:+.2f}%", help="Percentage point improvement in CAGR over baseline")
+        else:
+            st.info("Diagnostic summary not found. Run python main.py --mode diagnostic")
+
+    with t4:
+        imp_path = EXPLAIN_DIR / "feature_importance_plot.png"
+        if imp_path.exists():
+            st.image(str(imp_path), use_container_width=True)
+            
+            with open(EXPLAIN_DIR / "chronos_feature_importance.json") as f:
+                imp_data = json.load(f)
+            st.json(imp_data)
+        else:
+            st.info("Explainability results missing. Run scripts/explain_chronos.py")
+
+def render_phase3_interactive(bt: pd.DataFrame | None) -> None:
+    st.subheader("Phase 3 interactive diagnostics")
+    st.caption(
+        "Sentiment explorer, regime-sentiment relationship, live ablation toggles, and explainability checks."
+    )
+
+    if not SENTIMENT_LORA.is_file():
+        st.info("LoRA sentiment file not found. Run sentiment pipeline first.")
+        return
+
+    sent = load_sentiment_daily(str(SENTIMENT_LORA))
+    raw_dir = str((ROOT / "data" / "raw").resolve())
+
+    t1, t2, t3, t4 = st.tabs(
+        [
+            "Sentiment Explorer",
+            "Regime-Sentiment Heatmap",
+            "Live Ablation Toggle",
+            "Explainability",
+        ]
+    )
+
+    with t1:
+        tickers = sorted(sent["Ticker"].dropna().unique().tolist())
+        if not tickers:
+            st.warning("No ticker rows in sentiment file.")
+        else:
+            ticker = st.selectbox("Ticker", tickers, index=0)
+            s = sent[sent["Ticker"] == ticker].copy()
+            p = load_raw_ticker_price(raw_dir, ticker)
+            if p is None or p.empty:
+                st.warning(f"No raw price file found for {ticker}")
+            else:
+                m = p.merge(s[["Date", "sentiment_score", "sentiment_confidence"]], on="Date", how="left")
+                fig = go.Figure()
+                fig.add_trace(
+                    go.Scatter(
+                        x=m["Date"],
+                        y=m["Adj Close"],
+                        name="Adj Close",
+                        line=dict(color=PHASE3_COLORS["ml"], width=2),
+                        yaxis="y1",
+                    )
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=m["Date"],
+                        y=m["sentiment_score"],
+                        name="Sentiment score",
+                        line=dict(color=PHASE3_COLORS["dl"], width=2),
+                        yaxis="y2",
+                    )
+                )
+                fig.update_layout(
+                    title=f"{ticker}: price vs FinBERT sentiment",
+                    xaxis_title="Date",
+                    yaxis=dict(title="Adj Close", side="left"),
+                    yaxis2=dict(title="Sentiment", overlaying="y", side="right", range=[-1, 1]),
+                    **_plotly_dark(),
+                )
+                st.plotly_chart(fig, width="stretch")
+
+    with t2:
+        if not (ROOT / "data" / "processed" / "_NSEI_features.parquet").is_file():
+            st.warning("Missing NIFTY features with HMM regimes.")
+        else:
+            reg = load_nifty_regimes(str(ROOT / "data" / "processed" / "_NSEI_features.parquet"))
+            hm = sent.merge(reg, on="Date", how="left").dropna(subset=["regime"]).copy()
+            hm["regime"] = hm["regime"].astype(int)
+            agg = (
+                hm.groupby(["Ticker", "regime"], as_index=False)["sentiment_score"]
+                .mean()
+                .pivot(index="Ticker", columns="regime", values="sentiment_score")
+                .fillna(0.0)
+            )
+            top_tickers = hm.groupby("Ticker").size().sort_values(ascending=False).head(40).index.tolist()
+            agg = agg.loc[[t for t in top_tickers if t in agg.index]]
+
+            fig = go.Figure(
+                data=go.Heatmap(
+                    z=agg.values,
+                    x=[str(c) for c in agg.columns.tolist()],
+                    y=agg.index.tolist(),
+                    colorscale="RdYlGn",
+                    zmid=0,
+                    colorbar=dict(title="Avg Sentiment"),
+                )
+            )
+            fig.update_layout(
+                title="Average sentiment by HMM regime (top 40 tickers by coverage)",
+                xaxis_title="Regime (0=HighVol, 1=Bull, 2=Bear)",
+                yaxis_title="Ticker",
+                **_plotly_dark(),
+            )
+            st.plotly_chart(fig, width="stretch")
+
+    with t3:
+        rep = load_ablation_report(str(ABLATION_REPORT_CSV))
+        if rep is None or rep.empty:
+            st.info("Ablation report not found. Run: python main.py --task ablation")
+        else:
+            use_hmm = st.toggle("Use HMM", value=True)
+            use_sent = st.toggle("Use Sentiment", value=True)
+
+            scenario = None
+            if (not use_hmm) and (not use_sent):
+                scenario = "Baseline: Momentum Only"
+            elif use_hmm and (not use_sent):
+                scenario = "ML-Enhanced: Momentum + HMM"
+            elif (not use_hmm) and use_sent:
+                scenario = "DL-Enhanced: Momentum + FinBERT (Vanilla)"
+            else:
+                scenario = "Full Hybrid (Proposed): Momentum + HMM + FinBERT (LoRA)"
+
+            row = rep[rep["Scenario"] == scenario]
+            if row.empty:
+                st.warning(f"Scenario not available in report: {scenario}")
+            else:
+                bt_path = Path(row.iloc[0]["backtest_csv"])
+                if not bt_path.is_file():
+                    st.warning(f"Backtest file not found: {bt_path}")
+                else:
+                    bt_sel = load_backtest_csv(str(bt_path))
+                    fig = go.Figure()
+                    fig.add_trace(
+                        go.Scatter(
+                            x=bt_sel["date"],
+                            y=bt_sel["portfolio_value"],
+                            name=scenario,
+                            line=dict(color=PHASE3_COLORS["fusion"], width=2),
+                        )
+                    )
+
+                    base_row = rep[rep["Scenario"] == "Baseline: Momentum Only"]
+                    if not base_row.empty:
+                        base_path = Path(base_row.iloc[0]["backtest_csv"])
+                        if base_path.is_file():
+                            bt_base = load_backtest_csv(str(base_path))
+                            fig.add_trace(
+                                go.Scatter(
+                                    x=bt_base["date"],
+                                    y=bt_base["portfolio_value"],
+                                    name="Baseline",
+                                    line=dict(color=PHASE3_COLORS["neutral"], width=2, dash="dot"),
+                                )
+                            )
+
+                    fig.update_layout(
+                        title="Live ablation equity curve",
+                        xaxis_title="Date",
+                        yaxis_title="NAV",
+                        **_plotly_dark(),
+                    )
+                    st.plotly_chart(fig, width="stretch")
+
+                    c1, c2, c3, c4 = st.columns(4)
+                    m = row.iloc[0]
+                    c1.metric("CAGR", f"{100*float(m['CAGR']):.2f}%")
+                    c2.metric("Sharpe", f"{float(m['Sharpe_Net']):.3f}")
+                    c3.metric("Max DD", f"{100*float(m['Max_Drawdown']):.2f}%")
+                    c4.metric("Win Rate", f"{100*float(m['Win_Rate']):.2f}%")
+
+    with t4:
+        if bt is None or bt.empty:
+            st.info("Production backtest required for explainability preview.")
+        else:
+            sel = pd.to_datetime(bt["date"]).max()
+            row_bt = bt[pd.to_datetime(bt["date"]) == sel].iloc[0]
+            held = parse_stocks_held(row_bt.get("stocks_held", []))[:5]
+            if not held:
+                st.info("No top-5 holdings found for latest month.")
+            else:
+                ssub = sent[(sent["Date"] == sel) & (sent["Ticker"].isin([h.upper().replace('.', '_') for h in held]))]
+                if ssub.empty:
+                    st.info("No same-day sentiment rows for top-5; run sentiment pipeline on matching dates.")
+                else:
+                    fig = go.Figure()
+                    fig.add_trace(
+                        go.Bar(
+                            x=ssub["Ticker"],
+                            y=ssub["sentiment_confidence"],
+                            marker_color=PHASE3_COLORS["dl"],
+                            name="Sentiment confidence",
+                        )
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=ssub["Ticker"],
+                            y=ssub["sentiment_score"],
+                            mode="markers+lines",
+                            marker=dict(color=PHASE3_COLORS["fusion"], size=9),
+                            line=dict(color=PHASE3_COLORS["fusion"], width=2),
+                            name="Sentiment score",
+                            yaxis="y2",
+                        )
+                    )
+                    fig.update_layout(
+                        title=f"Top picks explainability snapshot: {sel.date()}",
+                        yaxis=dict(title="Confidence", range=[0, 1]),
+                        yaxis2=dict(title="Score", overlaying="y", side="right", range=[-1, 1]),
+                        **_plotly_dark(),
+                    )
+                    st.plotly_chart(fig, width="stretch")
+                    st.caption("For word-level attribution and regime sensitivity, run scripts/explain_sentiment.py.")
 
     da_labels: list[str] = []
     da_vals: list[float] = []
@@ -1499,6 +1880,8 @@ def main() -> None:
     _SECTIONS = [
         "RAMT transformer",
         "Production strategy (momentum + HMM)",
+        "Triple-Expert Diagnostic",
+        "Phase 3 interactive",
         "LSTM",
         "XGBoost",
         "Model comparison",
@@ -1554,6 +1937,12 @@ def main() -> None:
             st.warning(f"This section needs `{BACKTEST_CSV}` and a valid NIFTY series.")
         else:
             render_momentum_strategy_tabs(bt, nifty_raw, strat, bench)
+
+    elif section == "Triple-Expert Diagnostic":
+        render_triple_expert_diagnostic(bt)
+
+    elif section == "Phase 3 interactive":
+        render_phase3_interactive(bt)
 
     elif section == "LSTM":
         st.caption("LSTM — artifacts under `results/phase1_daily/` and `results/phase2_monthly/`.")

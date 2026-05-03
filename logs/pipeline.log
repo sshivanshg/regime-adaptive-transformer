@@ -1,0 +1,6 @@
+2026-05-03 08:48:12,905 | INFO | Generating sentiment files for vanilla and LoRA modes...
+2026-05-03 08:50:34,490 | INFO | Checking for sentiment data...
+2026-05-03 08:50:34,491 | WARNING | Missing 'data/raw/news_text.parquet'. Sentiment-based scenarios will be skipped.
+2026-05-03 08:50:34,491 | INFO | Running scenario: Baseline: Momentum Only
+2026-05-03 08:50:36,253 | INFO | Running scenario: ML-Enhanced: Momentum + HMM
+2026-05-03 08:50:37,675 | INFO | Saved ablation report: results/ablation_report.csv

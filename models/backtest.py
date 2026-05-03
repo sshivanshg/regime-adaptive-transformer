@@ -1,21 +1,14 @@
 """
-Portfolio Backtest 2015-2024
+User Story:
+As a backtest engineer, I need a realistic backtest engine that applies friction, stops,
+and regime-based position sizing so that reported performance reflects what would actually
+happen in live trading.
 
-Monthly rebalancing strategy:
-1. First trading day of month
-2. Check HMM regime
-3. If BULL: top N RAMT-ranked stocks at 100% allocation
-4. If HIGH_VOL: top 3 at 50% allocation
-5. If BEAR: top 5 at 20% allocation
-6. Hold until next month
-7. Repeat
-
-Metrics to report:
-- Annual return vs NIFTY
-- Sharpe ratio
-- Max drawdown
-- Win rate (% months beating NIFTY)
-- Best/worst month
+Implementation Approach:
+Implement a daily-resampled backtest that simulates monthly rebalancing, applies HMM regime
+sizing rules, calculates transaction costs at 0.22% per rebalance, enforces 7% per-stock
+stops and 15% portfolio drawdown killswitch, and reports net returns (after costs) versus
+benchmark.
 """
 
 from __future__ import annotations
