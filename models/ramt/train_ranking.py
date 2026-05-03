@@ -9,9 +9,15 @@ Loss: MSE on monthly alpha + ranking loss
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Union
+
+# Add project root to sys.path so 'models' can be imported when running script directly
+ROOT = Path(__file__).resolve().parent.parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import matplotlib
 
@@ -83,8 +89,8 @@ def _apply_y_scaler(data: dict[str, TickerData], y_scaler: RobustScaler) -> dict
 
 
 TRAIN_START = "2015-01-01"
-TRAIN_END = "2022-12-31"
-TEST_START = "2023-01-01"
+TRAIN_END = "2023-12-31"
+TEST_START = "2024-01-01"
 TEST_END = "2026-04-15"
 
 TICKERS = build_ticker_universe("data/processed")

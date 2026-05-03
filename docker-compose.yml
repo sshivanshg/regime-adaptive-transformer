@@ -1,0 +1,22 @@
+version: "3.9"
+
+services:
+  ramt:
+    build: .
+    container_name: ramt-final
+    command: python main.py --task all --config config/hybrid_config.yaml
+    volumes:
+      - ./:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  dashboard:
+    build: .
+    container_name: ramt-dashboard
+    command: streamlit run dashboard/app.py --server.port 8501 --server.address 0.0.0.0
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./:/app
+    environment:
+      - PYTHONUNBUFFERED=1

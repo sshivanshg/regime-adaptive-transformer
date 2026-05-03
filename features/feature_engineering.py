@@ -1,14 +1,14 @@
 """
-RAMT Data Pipeline — Step 2: Feature Engineering
-Transforms raw OHLCV(+Adj Close) data into a feature matrix per ticker.
+User Story:
+As a quant researcher, I need to transform raw OHLCV data into engineered features
+(returns, technical indicators, macro-adjusted targets) so that downstream models
+have clean, properly-aligned input data without look-ahead bias.
 
-This version is refactored for the NIFTY 200 Parquet-based raw store:
-- Batch-process all equity Parquet files in `data/raw/` (including ``_NSEI.parquet`` or ``_NSEI_raw.csv``).
-- Compute returns (log) over 1d, 5d, 21d using **Adj Close**.
-- Compute technicals: RSI(14), Bollinger Band distance, Volume Surge (Vol / SMA20 Vol).
-- Merge macro series (INDIAVIX, CRUDE, USDINR, SP500) using 1-day lagged returns (no leakage).
-- Target: Monthly_Alpha = ln(P_{t+21}/P_t) - ln(N_{t+21}/N_t), using **Adj Close**.
-- Output: `data/processed/{ticker}_features.parquet` (no CSV).
+Implementation Approach:
+Batch-process all equity Parquet files from data/raw/, compute log returns over
+multiple horizons (1d, 5d, 21d), derive technical indicators (RSI, Bollinger Bands,
+Volume Surge), merge macro series with 1-day lag to prevent leakage, and output
+per-ticker feature Parquet files with sector-neutralized alpha targets.
 """
 
 from __future__ import annotations

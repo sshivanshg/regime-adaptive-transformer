@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+
+# Add project root to sys.path so 'models' can be imported when running script directly
+ROOT = Path(__file__).resolve().parent.parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import numpy as np
 import pandas as pd
@@ -18,8 +24,8 @@ from models.ramt.dataset import ALL_FEATURE_COLS, build_ticker_universe
 SEQ_LEN = 30
 TARGET_COL = "Sector_Alpha"
 TRAIN_END = pd.Timestamp("2023-12-31")
-TEST_START = pd.Timestamp("2024-01-10")
-TEST_END = pd.Timestamp.max
+TEST_START = pd.Timestamp("2024-01-01")
+TEST_END = pd.Timestamp("2026-04-15")
 
 EPOCHS = 10
 BATCH_SIZE = 64

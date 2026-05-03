@@ -1,0 +1,67 @@
+seed: 42
+
+paths:
+  repo_root: .
+  nifty200_tickers: data/nifty200_tickers.txt
+  text_input: data/raw/news_text.parquet
+  sentiment_output: data/processed/sentiment/sentiment_features_lora.parquet
+  sentiment_cache_dir: data/processed/sentiment
+  processed_features_dir: data/processed
+  raw_dir: data/raw
+  nifty_features: data/processed/_NSEI_features.parquet
+  lora_adapter_checkpoint: results/lora/chronos_lora_adapter.pt
+  finbert_lora_adapter: models/lora_experiment/finbert_lora_adapter
+  ablation_results_dir: results/ablation
+  ablation_report: results/ablation_report.csv
+  pipeline_log: logs/pipeline.log
+
+sentiment_pipeline:
+  finbert_model_name: ProsusAI/finbert
+  finbert_max_length: 192
+  finbert_batch_size: 32
+  aggregation_half_life_hours: 12.0
+  date_columns:
+    - Date
+    - date
+    - published_at
+  ticker_columns:
+    - Ticker
+    - ticker
+    - symbol
+  timestamp_columns:
+    - published_at
+    - timestamp
+    - Date
+  text_columns:
+    - text
+    - headline
+    - summary
+    - content
+  required_columns:
+    date: Date
+    ticker: Ticker
+  chronos_input_dim: 10
+  chronos_seq_len: 20
+  chronos_blend_weight_finbert: 0.8
+  use_chronos_calibration: true
+  device: auto
+
+feature_integration:
+  locf_max_days: 3
+  sentiment_momentum_lookback: 5
+  fill_missing_with_neutral: true
+
+hybrid_strategy:
+  regime_mapping:
+    bull: 1
+    high_vol: 0
+    bear: 2
+  bull_sentiment_floor: -0.2
+  bear_sentiment_floor: 0.5
+  high_vol_momentum_weight: 0.6
+  high_vol_sentiment_weight: 0.4
+  top_n: 5
+
+ablation:
+  top_n: 5
+  capital: 100000
