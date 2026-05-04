@@ -1,0 +1,5 @@
+Scenario,CAGR,Sharpe,MaxDD,WinRate,Rebalances
+Baseline (Momentum+HMM),8.0%,0.99,-12.7%,65%,26
+Foundation Only (Chronos),5.4%,0.50,-16.6%,27%,26
+Simple Hybrid (50/50),11.1%,0.99,-13.2%,65%,26
+Triple-Expert (Hybrid+HMM),8.0%,0.99,-12.7%,65%,26
